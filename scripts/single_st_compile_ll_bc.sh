@@ -9,5 +9,5 @@ PLC="./rusty/target/debug/plc"
  
 mkdir -p "$OUTDIR"
  
-$PLC --bc --error-format clang -o "$OUTDIR/$NAME.bc" "$ST"
-$PLC --ir --error-format clang -o "$OUTDIR/$NAME.ll" "$ST"
+$PLC -g --bc --error-format clang -o "$OUTDIR/$NAME.bc" "$ST"
+$PLC -g --ir --error-format clang -o "$OUTDIR/$NAME.ll" "$ST"

@@ -1,0 +1,19 @@
+[package]
+name = "ir-analysis"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "ir_analysis"
+path = "src/lib.rs"
+
+[[bin]]
+name = "prism-analyze"
+path = "src/main.rs"
+
+
+[dependencies]
+inkwell    = { workspace = true }
+petgraph   = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
