@@ -1,0 +1,14 @@
+{
+    "files.exclude": {
+        "rusty": true
+    },
+    "search.exclude": {
+        "rusty": true
+    },
+    "files.watcherExclude": {
+        "rusty/": true
+    },
+    "rust-analyzer.files.exclude": [
+        "rusty/"
+    ]
+}

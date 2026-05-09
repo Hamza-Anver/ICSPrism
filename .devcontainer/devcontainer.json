@@ -1,0 +1,24 @@
+{
+  "name": "ICSQuartz Dev",
+  "image": "ubuntu:24.04",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/ICSPrism,type=bind",
+  "workspaceFolder": "/workspaces/ICSPrism",
+  "runArgs": [
+    "--platform", "linux/amd64",
+    "--cap-add=SYS_PTRACE",
+    "--security-opt", "seccomp=unconfined"
+  ],
+  "containerEnv": {
+    "DEBIAN_FRONTEND": "noninteractive"
+  },
+  "postCreateCommand": "apt-get update && apt-get install -y --no-install-recommends sudo curl wget git ca-certificates build-essential",
+  "remoteUser": "root",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "rust-lang.rust-analyzer"
+      ]
+    }
+  }
+}
