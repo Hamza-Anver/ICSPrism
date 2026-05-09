@@ -1,0 +1,7 @@
+[build]
+rustflags = [
+    "-L", "/workspaces/ICSPrism/benchmarks/out/harness_test_buggy",
+    "-l", "dylib=harness_test_buggy",
+    "-C", "link-arg=-Wl,-rpath,/workspaces/ICSPrism/benchmarks/out/harness_test_buggy",
+    "-C", "link-arg=-Wl,--allow-shlib-undefined",
+]
