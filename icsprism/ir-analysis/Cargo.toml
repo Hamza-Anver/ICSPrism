@@ -11,6 +11,10 @@ path = "src/lib.rs"
 name = "prism-analyze"
 path = "src/main.rs"
 
+[[bin]]
+name = "prism-harness"
+path = "src/harness_gen.rs"
+
 
 [dependencies]
 inkwell    = { workspace = true }

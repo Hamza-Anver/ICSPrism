@@ -1,21 +1,24 @@
-mod ddg; // only needed here if not going through lib — but we use lib
+mod ddg;
 mod layout;
 mod metadata;
 
 use inkwell::context::Context;
 use inkwell::memory_buffer::MemoryBuffer;
 use std::ffi::CString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: prism-analyze <file.ll|file.bc> [function_name]");
+    if args.len() < 3 {
+        eprintln!("Usage: prism-analyze <file.ll|file.bc> <output_prefix>");
+        eprintln!("  output_prefix: path without extension, e.g. benchmarks/out/foo/foo");
+        eprintln!("  produces: <prefix>_layout.json, <prefix>_ddg.json, <prefix>_ddg.dot");
         std::process::exit(1);
     }
 
-    let input_path = Path::new(&args[1]);
-    let function_filter: Option<&str> = args.get(2).map(|s| s.as_str());
+    let input_path    = Path::new(&args[1]);
+    let output_prefix = Path::new(&args[2]);
+    let function_filter: Option<&str> = args.get(3).map(|s| s.as_str());
 
     let stem = input_path.file_stem().unwrap_or_default().to_string_lossy();
     let out_dir = input_path.parent().unwrap_or(Path::new("."));
@@ -51,13 +54,13 @@ fn main() {
         }
     }
 
-    let layout_path = out_dir.join(format!("{}_layout.json", stem));
+    let layout_path = PathBuf::from(format!("{}_layout.json", output_prefix.display()));
+    let ddg_prefix  = PathBuf::from(format!("{}_ddg",         output_prefix.display()));
     let layout_json = serde_json::to_string_pretty(&layouts).unwrap();
     std::fs::write(&layout_path, &layout_json).expect("Failed to write layout JSON");
     println!("\n[+] Layout written: {}", layout_path.display());
 
     // --- DDG ---
-    let ddg_prefix = out_dir.join(format!("{}_ddg", stem));
     match ir_analysis::ddg::build_and_write_ddg(&module, &ir_text, function_filter, &ddg_prefix) {
         Ok(paths) => {
             println!("[+] DDG JSON: {}", paths.json_path.display());
