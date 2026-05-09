@@ -1,5 +1,5 @@
 {
-  "name": "ICSQuartz Dev",
+  "name": "ICSPrism Dev",
   "image": "ubuntu:24.04",
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/ICSPrism,type=bind",
   "workspaceFolder": "/workspaces/ICSPrism",
