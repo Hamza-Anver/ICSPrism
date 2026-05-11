@@ -22,9 +22,12 @@ use libafl_bolts::{
     shmem::{ShMemProvider, UnixShMemProvider},
     tuples::tuple_list,
 };
-use prism_runtime::{execute_testcase, harness_dimensions, load_config, required_input_len};
+use prism_runtime::{
+    execute_testcase_with_heartbeat, harness_dimensions, load_config, required_input_len,
+};
 
 const MAP_SIZE: usize = 65536;
+const STATE_HEARTBEAT_INTERVAL_SECS: u64 = 5;
 static mut COV_MAP_PTR: *mut u8 = std::ptr::null_mut();
 
 #[unsafe(no_mangle)]
@@ -123,7 +126,13 @@ fn main() {
         if data.len() < required_len {
             return ExitKind::Ok;
         }
-        let _ = execute_testcase(&config, data, in_size);
+        let _ = execute_testcase_with_heartbeat(
+            &config,
+            data,
+            in_size,
+            "prism-cov",
+            STATE_HEARTBEAT_INTERVAL_SECS,
+        );
         ExitKind::Ok
     };
 

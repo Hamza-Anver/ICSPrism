@@ -1,3 +1,11 @@
+{external}
+FUNCTION prism_bug_abort_if : DINT
+VAR_INPUT
+    should_abort : DINT;
+    bug_id       : DINT;
+END_VAR
+END_FUNCTION
+
 VAR_GLOBAL CONSTANT
     MODE_INIT  : SINT := 0;
     MODE_IDLE  : SINT := 1;
@@ -64,11 +72,6 @@ CASE Mode OF
         Mode := MODE_IDLE;
 
     MODE_IDLE:
-        IF CmdReset THEN
-            PressureScore := 0;
-            ArmedCycles := 0;
-            Offset := 0;
-        END_IF;
 
         IF CmdArm THEN
             Mode := MODE_ARMED;
@@ -78,12 +81,7 @@ CASE Mode OF
     MODE_ARMED:
         ArmedCycles := ArmedCycles + 1;
 
-        IF CmdReset THEN
-            Mode := MODE_IDLE;
-            PressureScore := 0;
-            ArmedCycles := 0;
-            Offset := 0;
-        ELSIF CmdStart AND ArmedCycles >= 3 THEN
+        IF CmdStart AND ArmedCycles >= 3 THEN
             Mode := MODE_RUN;
         END_IF;
 
@@ -108,6 +106,7 @@ CASE Mode OF
         // Requires entering RUN, then building enough history so Offset becomes large.
         // Input-only fuzzing with frequent resets should struggle more than stateful fuzzing.
         IF Buffer[1] > 1 THEN
+            prism_bug_abort_if(1, 9001);
             Buffer[Offset] := 1234;
         END_IF;
 
