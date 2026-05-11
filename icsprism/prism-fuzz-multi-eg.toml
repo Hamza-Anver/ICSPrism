@@ -1,0 +1,15 @@
+[execution]
+# single_cycle = current baseline behavior
+# scan_sequence = multi-cycle execution using repeated input frames
+mode = "scan_sequence"
+
+# Used when mode = "scan_sequence"
+cycles = 10000
+warmup_cycles = 0
+max_cycles = 10000
+
+# Reset PLC instance at start of each testcase
+per_testcase_reset = true
+
+# Executor timeout per testcase
+timeout_ms = 5000
