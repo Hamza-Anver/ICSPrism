@@ -2,14 +2,13 @@ use std::{
     collections::{HashMap, VecDeque},
     fs::File,
     path::PathBuf,
-    ptr::addr_of_mut,
 };
 
 use clap::Parser;
 use libafl::{
     corpus::{CorpusId, InMemoryCorpus, OnDiskCorpus},
     events::SimpleEventManager,
-    executors::{ExitKind, InProcessExecutor},
+    executors::{ExitKind, InProcessForkExecutor},
     feedbacks::{CrashFeedback, MaxMapFeedback},
     fuzzer::{Fuzzer, StdFuzzer},
     generators::RandBytesGenerator,
@@ -24,8 +23,9 @@ use libafl::{
 };
 use libafl_bolts::{
     rands::{Rand, StdRand},
+    shmem::{ShMemProvider, UnixShMemProvider},
     tuples::{tuple_list, Merge},
-    AsSlice, Named,
+    AsSliceMut, Named,
 };
 use serde::Deserialize;
 
@@ -65,10 +65,11 @@ unsafe extern "C" {
 }
 
 // ---------------------------------------------------------------------------
-// SanitizerCoverage hooks
+// SanitizerCoverage hooks — write into shmem so InProcessForkExecutor can
+// read coverage from the child after each fork.
 // ---------------------------------------------------------------------------
 const MAP_SIZE: usize = 65536;
-static mut EDGES_MAP: [u8; MAP_SIZE] = [0u8; MAP_SIZE];
+static mut COV_MAP_PTR: *mut u8 = std::ptr::null_mut();
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __sanitizer_cov_trace_pc_guard_init(mut start: *mut u32, stop: *mut u32) {
@@ -88,9 +89,13 @@ pub extern "C" fn __sanitizer_cov_trace_pc_guard_init(mut start: *mut u32, stop:
 #[unsafe(no_mangle)]
 pub extern "C" fn __sanitizer_cov_trace_pc_guard(guard: *mut u32) {
     unsafe {
+        if COV_MAP_PTR.is_null() {
+            return;
+        }
         let idx = *guard as usize;
         if idx < MAP_SIZE {
-            EDGES_MAP[idx] = EDGES_MAP[idx].wrapping_add(1);
+            let b = COV_MAP_PTR.add(idx);
+            *b = (*b).wrapping_add(1);
         }
     }
 }
@@ -324,7 +329,10 @@ fn main() {
             .unwrap_or_else(|e| panic!("Cannot open {:?}: {}", args.layout, e))
     ).unwrap_or_else(|e| panic!("Cannot parse layout JSON: {}", e));
 
-    let layout = layouts.into_iter().next()
+    // Layout JSON contains one entry per struct in the program.
+    // The last entry is always the top-level program struct (e.g. HarnessTest).
+    // Earlier entries are nested helper structs (e.g. Counter) — skip them.
+    let layout = layouts.into_iter().last()
         .expect("layout JSON is empty");
 
     println!("[prism-ddg] Program  : {}", layout.struct_name);
@@ -354,8 +362,13 @@ fn main() {
             layout.total_bytes, in_size);
     }
 
+    let mut shmem_provider = UnixShMemProvider::new().unwrap();
+    let mut edges_shmem = shmem_provider.new_shmem(MAP_SIZE).unwrap();
+    let edges_ptr = edges_shmem.as_slice_mut().as_mut_ptr();
+    unsafe { COV_MAP_PTR = edges_ptr; }
+
     let observer = HitcountsMapObserver::new(unsafe {
-        StdMapObserver::from_mut_ptr("edges", addr_of_mut!(EDGES_MAP) as *mut u8, MAP_SIZE)
+        StdMapObserver::from_mut_ptr("edges", edges_ptr, MAP_SIZE)
     });
 
     let mut feedback  = MaxMapFeedback::new(&observer);
@@ -377,24 +390,25 @@ fn main() {
     let harness_in_size = in_size;
     let mut harness = |input: &BytesInput| {
         let bytes = input.target_bytes();
-        let bytes = bytes.as_slice();
         if bytes.len() < harness_in_size {
             return ExitKind::Ok;
         }
         unsafe {
-            let instance = prism_alloc();
+let instance = prism_alloc();
             prism_run(instance, bytes.as_ptr(), bytes.len());
             prism_free(instance);
         }
         ExitKind::Ok
     };
 
-    let mut executor = InProcessExecutor::new(
+    let mut executor = InProcessForkExecutor::new(
         &mut harness,
         tuple_list!(observer),
         &mut fuzzer,
         &mut state,
         &mut mgr,
+        std::time::Duration::from_secs(5),
+        shmem_provider,
     ).unwrap();
 
     let mut generator = RandBytesGenerator::new(

@@ -1,10 +1,10 @@
-use std::{path::PathBuf, ptr::addr_of_mut};
+use std::path::PathBuf;
 
 use clap::Parser;
 use libafl::{
     corpus::{InMemoryCorpus, OnDiskCorpus},
     events::SimpleEventManager,
-    executors::{ExitKind, InProcessExecutor},
+    executors::{ExitKind, InProcessForkExecutor},
     feedbacks::{CrashFeedback, MaxMapFeedback},
     fuzzer::{Fuzzer, StdFuzzer},
     generators::RandBytesGenerator,
@@ -16,7 +16,12 @@ use libafl::{
     stages::StdMutationalStage,
     state::StdState,
 };
-use libafl_bolts::{rands::StdRand, tuples::tuple_list, AsSlice};
+use libafl_bolts::{
+    rands::StdRand,
+    shmem::{ShMemProvider, UnixShMemProvider},
+    tuples::tuple_list,
+    AsSliceMut,
+};
 use serde::Deserialize;
 
 unsafe extern "C" {
@@ -40,10 +45,11 @@ unsafe extern "C" {
 }
 
 // ---------------------------------------------------------------------------
-// SanitizerCoverage hooks — must be resolved at link time, not via dlopen
+// SanitizerCoverage hooks — write into shmem so InProcessForkExecutor can
+// read coverage from the child after each fork.
 // ---------------------------------------------------------------------------
 const MAP_SIZE: usize = 65536;
-static mut EDGES_MAP: [u8; MAP_SIZE] = [0u8; MAP_SIZE];
+static mut COV_MAP_PTR: *mut u8 = std::ptr::null_mut();
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __sanitizer_cov_trace_pc_guard_init(mut start: *mut u32, stop: *mut u32) {
@@ -63,9 +69,13 @@ pub extern "C" fn __sanitizer_cov_trace_pc_guard_init(mut start: *mut u32, stop:
 #[unsafe(no_mangle)]
 pub extern "C" fn __sanitizer_cov_trace_pc_guard(guard: *mut u32) {
     unsafe {
+        if COV_MAP_PTR.is_null() {
+            return;
+        }
         let idx = *guard as usize;
         if idx < MAP_SIZE {
-            EDGES_MAP[idx] = EDGES_MAP[idx].wrapping_add(1);
+            let b = COV_MAP_PTR.add(idx);
+            *b = (*b).wrapping_add(1);
         }
     }
 }
@@ -152,8 +162,13 @@ fn main() {
     println!("[prism-cov] Struct   : {} bytes", struct_bytes);
     println!("[prism-cov] Crashes  : {}", args.crashes.display());
 
+    let mut shmem_provider = UnixShMemProvider::new().unwrap();
+    let mut edges_shmem = shmem_provider.new_shmem(MAP_SIZE).unwrap();
+    let edges_ptr = edges_shmem.as_slice_mut().as_mut_ptr();
+    unsafe { COV_MAP_PTR = edges_ptr; }
+
     let observer = HitcountsMapObserver::new(unsafe {
-        StdMapObserver::from_mut_ptr("edges", addr_of_mut!(EDGES_MAP) as *mut u8, MAP_SIZE)
+        StdMapObserver::from_mut_ptr("edges", edges_ptr, MAP_SIZE)
     });
 
     let mut feedback  = MaxMapFeedback::new(&observer);
@@ -174,7 +189,6 @@ fn main() {
 
     let mut harness = |input: &BytesInput| {
         let bytes = input.target_bytes();
-        let bytes = bytes.as_slice();
         if bytes.len() < in_size {
             return ExitKind::Ok;
         }
@@ -186,12 +200,14 @@ fn main() {
         ExitKind::Ok
     };
 
-    let mut executor = InProcessExecutor::new(
+    let mut executor = InProcessForkExecutor::new(
         &mut harness,
         tuple_list!(observer),
         &mut fuzzer,
         &mut state,
         &mut mgr,
+        std::time::Duration::from_secs(5),
+        shmem_provider,
     ).unwrap();
 
     let mut generator = RandBytesGenerator::new(
