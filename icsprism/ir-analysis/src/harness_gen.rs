@@ -196,6 +196,7 @@ fn emit_header(out: &mut String, program_name: &str) {
     writeln!(out, "#include <stddef.h>").unwrap();
     writeln!(out, "#include <string.h>").unwrap();
     writeln!(out, "#include <stdlib.h>").unwrap();
+    writeln!(out, "#include <stdio.h>").unwrap();
     writeln!(out).unwrap();
 }
 
@@ -383,6 +384,23 @@ fn emit_lifecycle(out: &mut String, layout: &ProgramLayout) {
 
     writeln!(out, "void prism_free(void *instance) {{").unwrap();
     writeln!(out, "    free(instance);").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(
+        out,
+        "int32_t prism_bug_abort_if(int32_t should_abort, int32_t bug_id) {{"
+    )
+    .unwrap();
+    writeln!(out, "    if (should_abort != 0) {{").unwrap();
+    writeln!(
+        out,
+        "        fprintf(stderr, \"[prism-bug] id=%d\\n\", (int)bug_id);"
+    )
+    .unwrap();
+    writeln!(out, "        __builtin_trap();").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    return 0;").unwrap();
     writeln!(out, "}}").unwrap();
     writeln!(out).unwrap();
 
