@@ -94,8 +94,12 @@ pub(crate) fn build_ssa_name_map(ir: &str) -> HashMap<String, String> {
         if !(line.contains("llvm.dbg.value") || line.contains("llvm.dbg.declare")) {
             continue;
         }
-        let Some(ssa) = first_ssa_in_line(line) else { continue };
-        let Some(md_ref) = extract_metadata_ref_after(line, "metadata !") else { continue };
+        let Some(ssa) = first_ssa_in_line(line) else {
+            continue;
+        };
+        let Some(md_ref) = extract_metadata_ref_after(line, "metadata !") else {
+            continue;
+        };
         if let Some(var_name) = local_names.get(&md_ref) {
             aliases.insert(ssa, var_name.clone());
         }

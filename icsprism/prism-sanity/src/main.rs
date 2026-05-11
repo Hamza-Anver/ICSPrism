@@ -45,11 +45,7 @@ fn fail<T>(msg: impl Into<String>) -> CheckResult<T> {
 }
 
 fn require(condition: bool, msg: impl Into<String>) -> CheckResult<()> {
-    if condition {
-        Ok(())
-    } else {
-        fail(msg)
-    }
+    if condition { Ok(()) } else { fail(msg) }
 }
 
 fn field_name(idx: u32) -> CheckResult<String> {
@@ -106,13 +102,19 @@ fn get_field_bytes(instance: *const u8, idx: u32) -> CheckResult<Vec<u8>> {
 
 fn get_field_i16(instance: *const u8, idx: u32) -> CheckResult<i16> {
     let bytes = get_field_bytes(instance, idx)?;
-    require(bytes.len() == 2, format!("field idx={idx} is not i16-sized"))?;
+    require(
+        bytes.len() == 2,
+        format!("field idx={idx} is not i16-sized"),
+    )?;
     Ok(i16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
 fn get_field_bool(instance: *const u8, idx: u32) -> CheckResult<bool> {
     let bytes = get_field_bytes(instance, idx)?;
-    require(bytes.len() == 1, format!("field idx={idx} is not bool-sized"))?;
+    require(
+        bytes.len() == 1,
+        format!("field idx={idx} is not bool-sized"),
+    )?;
     Ok(bytes[0] != 0)
 }
 
@@ -132,7 +134,10 @@ fn run_checks() -> CheckResult<()> {
     let state_size = unsafe { prism_state_size() };
     let struct_size = unsafe { prism_struct_size() };
     require(field_count > 0, "prism_field_count must be > 0")?;
-    require(input_size >= 4, format!("prism_input_size too small: {input_size}"))?;
+    require(
+        input_size >= 4,
+        format!("prism_input_size too small: {input_size}"),
+    )?;
     require(state_size > 0, "prism_state_size must be > 0")?;
     require(struct_size > 0, "prism_struct_size must be > 0")?;
 
@@ -165,8 +170,14 @@ fn run_checks() -> CheckResult<()> {
     let acc = get_field_i16(instance.0, idx_acc)?;
     let edge_count = get_field_i16(instance.0, idx_edge)?;
     let armed = get_field_bool(instance.0, idx_armed)?;
-    require(cycle == 3, format!("scan cycle failed: CycleNum={cycle}, expected 3"))?;
-    require(acc == 12, format!("accumulator failed: Accumulator={acc}, expected 12"))?;
+    require(
+        cycle == 3,
+        format!("scan cycle failed: CycleNum={cycle}, expected 3"),
+    )?;
+    require(
+        acc == 12,
+        format!("accumulator failed: Accumulator={acc}, expected 12"),
+    )?;
     require(
         edge_count == 1,
         format!("edge tracking failed: EdgeCount={edge_count}, expected 1"),

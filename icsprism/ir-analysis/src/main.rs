@@ -16,7 +16,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    let input_path    = Path::new(&args[1]);
+    let input_path = Path::new(&args[1]);
     let output_prefix = Path::new(&args[2]);
     let function_filter: Option<&str> = args.get(3).map(|s| s.as_str());
 
@@ -55,7 +55,7 @@ fn main() {
     }
 
     let layout_path = PathBuf::from(format!("{}_layout.json", output_prefix.display()));
-    let ddg_prefix  = PathBuf::from(format!("{}_ddg",         output_prefix.display()));
+    let ddg_prefix = PathBuf::from(format!("{}_ddg", output_prefix.display()));
     let layout_json = serde_json::to_string_pretty(&layouts).unwrap();
     std::fs::write(&layout_path, &layout_json).expect("Failed to write layout JSON");
     println!("\n[+] Layout written: {}", layout_path.display());

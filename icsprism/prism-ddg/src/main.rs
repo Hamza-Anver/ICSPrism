@@ -6,6 +6,7 @@ use std::{
 
 use clap::Parser;
 use libafl::{
+    Error,
     corpus::{CorpusId, InMemoryCorpus, OnDiskCorpus},
     events::SimpleEventManager,
     executors::{ExitKind, InProcessForkExecutor},
@@ -14,55 +15,20 @@ use libafl::{
     generators::RandBytesGenerator,
     inputs::{BytesInput, HasTargetBytes},
     monitors::SimpleMonitor,
-    mutators::{havoc_mutations, HavocScheduledMutator, MutationResult, Mutator},
+    mutators::{HavocScheduledMutator, MutationResult, Mutator, havoc_mutations},
     observers::{HitcountsMapObserver, StdMapObserver},
     schedulers::QueueScheduler,
     stages::StdMutationalStage,
     state::{HasRand, StdState},
-    Error,
 };
 use libafl_bolts::{
+    AsSliceMut, Named,
     rands::{Rand, StdRand},
     shmem::{ShMemProvider, UnixShMemProvider},
-    tuples::{tuple_list, Merge},
-    AsSliceMut, Named,
+    tuples::{Merge, tuple_list},
 };
+use prism_runtime::{execute_testcase, harness_dimensions, load_config, required_input_len};
 use serde::Deserialize;
-
-// ---------------------------------------------------------------------------
-// Harness ABI
-// ---------------------------------------------------------------------------
-unsafe extern "C" {
-    fn prism_alloc() -> *mut u8;
-    #[allow(dead_code)]
-    fn prism_reset(instance: *mut u8);
-    fn prism_free(instance: *mut u8);
-    fn prism_run(instance: *mut u8, data: *const u8, len: usize);
-    #[allow(dead_code)]
-    fn prism_step(instance: *mut u8);
-    #[allow(dead_code)]
-    fn prism_get_state(instance: *const u8, out: *mut u8);
-    #[allow(dead_code)]
-    fn prism_set_state(instance: *mut u8, state: *const u8, len: usize);
-    #[allow(dead_code)]
-    fn prism_state_size() -> usize;
-    fn prism_input_size() -> usize;
-    fn prism_struct_size() -> usize;
-    #[allow(dead_code)]
-    fn prism_field_count() -> u32;
-    #[allow(dead_code)]
-    fn prism_field_name(idx: u32) -> *const i8;
-    #[allow(dead_code)]
-    fn prism_field_offset(idx: u32) -> usize;
-    #[allow(dead_code)]
-    fn prism_field_size(idx: u32) -> usize;
-    #[allow(dead_code)]
-    fn prism_field_is_input(idx: u32) -> i32;
-    #[allow(dead_code)]
-    fn prism_get_field(instance: *const u8, idx: u32, out: *mut u8) -> usize;
-    #[allow(dead_code)]
-    fn prism_set_field(instance: *mut u8, idx: u32, data: *const u8, len: usize) -> i32;
-}
 
 // ---------------------------------------------------------------------------
 // SanitizerCoverage hooks — write into shmem so InProcessForkExecutor can
@@ -117,6 +83,9 @@ struct Args {
 
     #[arg(short, long, default_value_t = 8)]
     seeds: usize,
+
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -179,7 +148,9 @@ fn is_fuzzable(field: &FieldLayout) -> bool {
 fn build_byte_weights(ddg: &Ddg, layout: &ProgramLayout) -> Vec<f32> {
     let input_size = layout.total_bytes as usize;
 
-    let sinks: Vec<u64> = ddg.nodes.iter()
+    let sinks: Vec<u64> = ddg
+        .nodes
+        .iter()
         .filter(|n| n.has_dynamic_index)
         .map(|n| n.id)
         .collect();
@@ -217,27 +188,49 @@ fn build_byte_weights(ddg: &Ddg, layout: &ProgramLayout) -> Vec<f32> {
     for node in &ddg.nodes {
         if let Some(def) = &node.defines {
             let field_name = def.trim_start_matches('%').to_string();
-            let score = dist.get(&node.id)
+            let score = dist
+                .get(&node.id)
                 .map(|&d| 1.0 / (1.0 + d as f32))
                 .unwrap_or(0.0);
             let entry = name_score.entry(field_name).or_insert(0.0);
-            if score > *entry { *entry = score; }
+            if score > *entry {
+                *entry = score;
+            }
         }
     }
 
     let mut weights = vec![0.0f32; input_size];
     for field in &layout.fields {
-        if !is_fuzzable(field) { continue; }
+        if !is_fuzzable(field) {
+            continue;
+        }
         let name = field.name.as_deref().unwrap_or("");
         let score = name_score.get(name).copied().unwrap_or(0.0);
         let start = field.byte_offset as usize;
-        let end   = (start + field.byte_size as usize).min(input_size);
+        let end = (start + field.byte_size as usize).min(input_size);
         for b in start..end {
             weights[b] = score;
         }
     }
 
     weights
+}
+
+fn expand_weights(weights: &[f32], required_len: usize) -> Vec<f32> {
+    if weights.is_empty() {
+        return vec![1.0; required_len.max(1)];
+    }
+    if required_len <= weights.len() {
+        return weights[..required_len].to_vec();
+    }
+
+    let mut out = Vec::with_capacity(required_len);
+    while out.len() < required_len {
+        let remaining = required_len - out.len();
+        let take = remaining.min(weights.len());
+        out.extend_from_slice(&weights[..take]);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -280,11 +273,7 @@ impl<S> Mutator<BytesInput, S> for DdgByteMutator
 where
     S: HasRand,
 {
-    fn mutate(
-        &mut self,
-        state: &mut S,
-        input: &mut BytesInput,
-    ) -> Result<MutationResult, Error> {
+    fn mutate(&mut self, state: &mut S, input: &mut BytesInput) -> Result<MutationResult, Error> {
         let bytes: &mut Vec<u8> = input.as_mut();
 
         if bytes.is_empty() || self.cumulative.is_empty() {
@@ -303,11 +292,7 @@ where
         Ok(MutationResult::Mutated)
     }
 
-    fn post_exec(
-        &mut self,
-        _state: &mut S,
-        _new_corpus_id: Option<CorpusId>,
-    ) -> Result<(), Error> {
+    fn post_exec(&mut self, _state: &mut S, _new_corpus_id: Option<CorpusId>) -> Result<(), Error> {
         Ok(())
     }
 }
@@ -318,60 +303,81 @@ where
 
 fn main() {
     let args = Args::parse();
+    let loaded = load_config(args.config.as_deref()).unwrap_or_else(|e| panic!("[prism-ddg] {e}"));
 
     let ddg: Ddg = serde_json::from_reader(
-        File::open(&args.ddg)
-            .unwrap_or_else(|e| panic!("Cannot open {:?}: {}", args.ddg, e))
-    ).unwrap_or_else(|e| panic!("Cannot parse DDG JSON: {}", e));
+        File::open(&args.ddg).unwrap_or_else(|e| panic!("Cannot open {:?}: {}", args.ddg, e)),
+    )
+    .unwrap_or_else(|e| panic!("Cannot parse DDG JSON: {}", e));
 
     let layouts: Vec<ProgramLayout> = serde_json::from_reader(
-        File::open(&args.layout)
-            .unwrap_or_else(|e| panic!("Cannot open {:?}: {}", args.layout, e))
-    ).unwrap_or_else(|e| panic!("Cannot parse layout JSON: {}", e));
+        File::open(&args.layout).unwrap_or_else(|e| panic!("Cannot open {:?}: {}", args.layout, e)),
+    )
+    .unwrap_or_else(|e| panic!("Cannot parse layout JSON: {}", e));
 
     // Layout JSON contains one entry per struct in the program.
     // The last entry is always the top-level program struct (e.g. HarnessTest).
     // Earlier entries are nested helper structs (e.g. Counter) — skip them.
-    let layout = layouts.into_iter().last()
-        .expect("layout JSON is empty");
+    let layout = layouts.into_iter().last().expect("layout JSON is empty");
 
     println!("[prism-ddg] Program  : {}", layout.struct_name);
-    println!("[prism-ddg] Layout   : {} bytes, {} fields", layout.total_bytes, layout.fields.len());
+    println!(
+        "[prism-ddg] Layout   : {} bytes, {} fields",
+        layout.total_bytes,
+        layout.fields.len()
+    );
 
-    let weights = build_byte_weights(&ddg, &layout);
+    let base_weights = build_byte_weights(&ddg, &layout);
 
     println!("[prism-ddg] Field weights:");
     for field in &layout.fields {
-        if !is_fuzzable(field) { continue; }
-        let name  = field.name.as_deref().unwrap_or("<unnamed>");
-        let b     = field.byte_offset as usize;
-        let score = weights.get(b).copied().unwrap_or(0.0);
-        println!("[prism-ddg]   {:20} offset={:>3} size={:>2}  score={:.4}",
-            name, b, field.byte_size, score);
+        if !is_fuzzable(field) {
+            continue;
+        }
+        let name = field.name.as_deref().unwrap_or("<unnamed>");
+        let b = field.byte_offset as usize;
+        let score = base_weights.get(b).copied().unwrap_or(0.0);
+        println!(
+            "[prism-ddg]   {:20} offset={:>3} size={:>2}  score={:.4}",
+            name, b, field.byte_size, score
+        );
     }
 
-    let in_size      = unsafe { prism_input_size() };
-    let struct_bytes = unsafe { prism_struct_size() };
+    let dims = harness_dimensions();
+    let in_size = dims.input_size;
+    let required_len = required_input_len(&loaded.config, in_size);
+    let weights = expand_weights(&base_weights, required_len);
 
-    println!("[prism-ddg] Harness input : {} bytes", in_size);
-    println!("[prism-ddg] Harness struct: {} bytes", struct_bytes);
+    println!("[prism-ddg] Harness frame : {} bytes", in_size);
+    println!("[prism-ddg] Harness input : {} bytes", required_len);
+    println!("[prism-ddg] Harness state : {} bytes", dims.state_size);
+    println!("[prism-ddg] Harness struct: {} bytes", dims.struct_size);
+    println!(
+        "[prism-ddg] Mode          : {:?}",
+        loaded.config.execution.mode
+    );
+    println!("[prism-ddg] Config        : {}", loaded.source_label());
     println!("[prism-ddg] Crashes       : {}", args.crashes.display());
 
     if in_size != layout.total_bytes as usize {
-        println!("[prism-ddg] WARNING: layout total_bytes={} vs harness input_size={} — weights may misalign",
-            layout.total_bytes, in_size);
+        println!(
+            "[prism-ddg] WARNING: layout total_bytes={} vs harness input_size={} — weights may misalign",
+            layout.total_bytes, in_size
+        );
     }
 
     let mut shmem_provider = UnixShMemProvider::new().unwrap();
     let mut edges_shmem = shmem_provider.new_shmem(MAP_SIZE).unwrap();
     let edges_ptr = edges_shmem.as_slice_mut().as_mut_ptr();
-    unsafe { COV_MAP_PTR = edges_ptr; }
+    unsafe {
+        COV_MAP_PTR = edges_ptr;
+    }
 
     let observer = HitcountsMapObserver::new(unsafe {
         StdMapObserver::from_mut_ptr("edges", edges_ptr, MAP_SIZE)
     });
 
-    let mut feedback  = MaxMapFeedback::new(&observer);
+    let mut feedback = MaxMapFeedback::new(&observer);
     let mut objective = CrashFeedback::new();
 
     let mut state = StdState::new(
@@ -380,24 +386,22 @@ fn main() {
         OnDiskCorpus::new(args.crashes).unwrap(),
         &mut feedback,
         &mut objective,
-    ).unwrap();
+    )
+    .unwrap();
 
-    let monitor    = SimpleMonitor::new(|s| println!("{s}"));
-    let mut mgr    = SimpleEventManager::new(monitor);
-    let scheduler  = QueueScheduler::new();
+    let monitor = SimpleMonitor::new(|s| println!("{s}"));
+    let mut mgr = SimpleEventManager::new(monitor);
+    let scheduler = QueueScheduler::new();
     let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
 
-    let harness_in_size = in_size;
-    let mut harness = |input: &BytesInput| {
+    let config = loaded.config.clone();
+    let mut harness = move |input: &BytesInput| {
         let bytes = input.target_bytes();
-        if bytes.len() < harness_in_size {
+        let data: &[u8] = bytes.as_ref();
+        if data.len() < required_len {
             return ExitKind::Ok;
         }
-        unsafe {
-let instance = prism_alloc();
-            prism_run(instance, bytes.as_ptr(), bytes.len());
-            prism_free(instance);
-        }
+        let _ = execute_testcase(&config, data, in_size);
         ExitKind::Ok
     };
 
@@ -407,29 +411,31 @@ let instance = prism_alloc();
         &mut fuzzer,
         &mut state,
         &mut mgr,
-        std::time::Duration::from_secs(5),
+        std::time::Duration::from_millis(loaded.config.execution.timeout_ms),
         shmem_provider,
-    ).unwrap();
+    )
+    .unwrap();
 
-    let mut generator = RandBytesGenerator::new(
-        std::num::NonZeroUsize::new(in_size.max(1)).unwrap()
-    );
+    let mut generator =
+        RandBytesGenerator::new(std::num::NonZeroUsize::new(required_len.max(1)).unwrap());
 
-    state.generate_initial_inputs_forced(
-        &mut fuzzer,
-        &mut executor,
-        &mut generator,
-        &mut mgr,
-        args.seeds,
-    ).unwrap();
+    state
+        .generate_initial_inputs_forced(
+            &mut fuzzer,
+            &mut executor,
+            &mut generator,
+            &mut mgr,
+            args.seeds,
+        )
+        .unwrap();
 
     let ddg_mutator = DdgByteMutator::new(weights);
-    let mutator = HavocScheduledMutator::new(
-        tuple_list!(ddg_mutator).merge(havoc_mutations())
-    );
+    let mutator = HavocScheduledMutator::new(tuple_list!(ddg_mutator).merge(havoc_mutations()));
     let mut stages = tuple_list!(StdMutationalStage::new(mutator));
 
     println!("[prism-ddg] Fuzzing — Ctrl+C to stop");
 
-    fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr).unwrap();
+    fuzzer
+        .fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)
+        .unwrap();
 }

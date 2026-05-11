@@ -1,7 +1,7 @@
-use std::collections::HashMap;
 use inkwell::module::Module;
 use inkwell::values::{AnyValue, AsValueRef, InstructionOpcode};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::metadata::build_ssa_name_map;
@@ -68,17 +68,16 @@ pub fn build_and_write_ddg(
 ) -> Result<DdgOutputPaths, std::io::Error> {
     let graph = build_ddg(module, ir_text, function_filter);
     let json_path = out_prefix.with_extension("json");
-    let dot_path  = out_prefix.with_extension("dot");
+    let dot_path = out_prefix.with_extension("dot");
     std::fs::write(&json_path, graph_to_json(&graph))?;
-    std::fs::write(&dot_path,  graph_to_dot(&graph))?;
-    Ok(DdgOutputPaths { json_path, dot_path })
+    std::fs::write(&dot_path, graph_to_dot(&graph))?;
+    Ok(DdgOutputPaths {
+        json_path,
+        dot_path,
+    })
 }
 
-pub fn build_ddg(
-    module: &Module<'_>,
-    ir_text: &str,
-    function_filter: Option<&str>,
-) -> DdgGraph {
+pub fn build_ddg(module: &Module<'_>, ir_text: &str, function_filter: Option<&str>) -> DdgGraph {
     let mut graph = DdgGraph::default();
     let ssa_names = build_ssa_name_map(ir_text);
 
@@ -106,15 +105,11 @@ pub fn build_ddg(
         }
 
         for bb in function.get_basic_blocks() {
-            let bb_name = bb
-                .get_name()
-                .to_str()
-                .unwrap_or("?")
-                .to_string();
+            let bb_name = bb.get_name().to_str().unwrap_or("?").to_string();
 
             let mut cursor = bb.get_first_instruction();
             while let Some(inst) = cursor {
-                let ir     = inst.print_to_string().to_string();
+                let ir = inst.print_to_string().to_string();
                 let opcode = inst.get_opcode();
                 let op_str = format!("{:?}", opcode);
                 let defines = parse_ssa_def(&ir);
@@ -125,9 +120,7 @@ pub fn build_ddg(
                     None
                 };
 
-                let human_name = defines
-                    .as_ref()
-                    .and_then(|ssa| ssa_names.get(ssa).cloned());
+                let human_name = defines.as_ref().and_then(|ssa| ssa_names.get(ssa).cloned());
 
                 let callee = extract_callee(opcode, &inst, &ir);
                 let has_dynamic_index = is_dynamic_gep(opcode, &inst);
@@ -150,7 +143,9 @@ pub fn build_ddg(
 
                 // SSA def-use edges
                 for i in 0..inst.get_num_operands() {
-                    let Some(operand) = inst.get_operand(i) else { continue };
+                    let Some(operand) = inst.get_operand(i) else {
+                        continue;
+                    };
                     let Some(val) = operand.value() else { continue };
                     let key = val.as_value_ref() as usize as u64;
                     if let Some(&src) = def_by_value.get(&key) {
@@ -217,7 +212,10 @@ fn parse_ssa_def(ir: &str) -> Option<String> {
     }
     let eq = t.find('=')?;
     let lhs = t[..eq].trim();
-    if lhs[1..].chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+    if lhs[1..]
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+    {
         Some(lhs.to_string())
     } else {
         None
@@ -229,7 +227,7 @@ fn memory_pointer_key(
     inst: &inkwell::values::InstructionValue<'_>,
 ) -> Option<(u64, String)> {
     let idx = match opcode {
-        InstructionOpcode::Load  => 0,
+        InstructionOpcode::Load => 0,
         InstructionOpcode::Store => 1,
         _ => return None,
     };
@@ -286,15 +284,14 @@ fn extract_callee(
 }
 
 /// True if a GEP instruction has at least one non-constant index operand.
-fn is_dynamic_gep(
-    opcode: InstructionOpcode,
-    inst: &inkwell::values::InstructionValue<'_>,
-) -> bool {
+fn is_dynamic_gep(opcode: InstructionOpcode, inst: &inkwell::values::InstructionValue<'_>) -> bool {
     if opcode != InstructionOpcode::GetElementPtr {
         return false;
     }
     for i in 1..inst.get_num_operands() {
-        let Some(op) = inst.get_operand(i) else { continue };
+        let Some(op) = inst.get_operand(i) else {
+            continue;
+        };
         let Some(val) = op.value() else { continue };
         let printed = val.print_to_string().to_string();
         if printed.trim_start().starts_with('%') {
@@ -309,8 +306,7 @@ fn is_dynamic_gep(
 // ---------------------------------------------------------------------------
 
 fn graph_to_json(g: &DdgGraph) -> String {
-    serde_json::to_string_pretty(g)
-        .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e))
+    serde_json::to_string_pretty(g).unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e))
 }
 
 fn graph_to_dot(g: &DdgGraph) -> String {
@@ -321,25 +317,31 @@ fn graph_to_dot(g: &DdgGraph) -> String {
     let _ = writeln!(out, "  node [shape=box fontsize=9];");
 
     for n in &g.nodes {
-        let display = n.human_name
+        let display = n
+            .human_name
             .as_deref()
             .or(n.defines.as_deref())
             .unwrap_or("");
-        let tag = if n.has_dynamic_index { " [dyn-idx]" } else { "" };
+        let tag = if n.has_dynamic_index {
+            " [dyn-idx]"
+        } else {
+            ""
+        };
         let label = format!("{}\\n{}\\n{}{}", n.id, n.opcode, display, tag);
         let _ = writeln!(out, "  n{} [label=\"{}\"];", n.id, dot_esc(&label));
     }
 
     for e in &g.edges {
         let style = match e.kind.as_str() {
-            "data_memory"      => " style=dashed",
+            "data_memory" => " style=dashed",
             "memory_overwrite" => " style=dotted color=red",
-            _                  => "",
+            _ => "",
         };
         let _ = writeln!(
             out,
             "  n{} -> n{} [label=\"{}\"{style}];",
-            e.from, e.to,
+            e.from,
+            e.to,
             dot_esc(&e.kind)
         );
     }
@@ -350,6 +352,6 @@ fn graph_to_dot(g: &DdgGraph) -> String {
 
 fn dot_esc(s: &str) -> String {
     s.replace('\\', "\\\\")
-     .replace('"', "\\\"")
-     .replace('\n', "\\n")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }

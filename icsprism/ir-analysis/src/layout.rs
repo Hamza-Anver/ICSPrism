@@ -12,15 +12,14 @@
 // RuSTy always names the struct the same as the function, so for function @prg
 // we call module.get_struct_type("prg").
 
-use std::collections::HashMap;
 use inkwell::module::Module;
 use inkwell::targets::TargetData;
 use inkwell::types::BasicTypeEnum;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::metadata::{
-    extract_metadata_map, extract_metadata_ref_after,
-    extract_metadata_refs, extract_quoted_arg,
+    extract_metadata_map, extract_metadata_ref_after, extract_metadata_refs, extract_quoted_arg,
 };
 
 // ---------------------------------------------------------------------------

@@ -2,5 +2,5 @@ pub mod ddg;
 pub mod layout;
 pub mod metadata;
 
-pub use ddg::{build_ddg, DdgGraph, GraphEdge, GraphNode};
-pub use layout::{extract_layout, FieldLayout, ProgramLayout};
+pub use ddg::{DdgGraph, GraphEdge, GraphNode, build_ddg};
+pub use layout::{FieldLayout, ProgramLayout, extract_layout};
