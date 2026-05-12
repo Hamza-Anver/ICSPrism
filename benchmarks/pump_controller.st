@@ -72,6 +72,11 @@ CASE Mode OF
         Mode := MODE_IDLE;
 
     MODE_IDLE:
+        IF CmdReset THEN
+            PressureScore := 0;
+            ArmedCycles := 0;
+            Offset := 0;
+        END_IF;
 
         IF CmdArm THEN
             Mode := MODE_ARMED;
@@ -81,7 +86,12 @@ CASE Mode OF
     MODE_ARMED:
         ArmedCycles := ArmedCycles + 1;
 
-        IF CmdStart AND ArmedCycles >= 3 THEN
+        IF CmdReset THEN
+            Mode := MODE_IDLE;
+            PressureScore := 0;
+            ArmedCycles := 0;
+            Offset := 0;
+        ELSIF CmdStart AND ArmedCycles >= 3 THEN
             Mode := MODE_RUN;
         END_IF;
 
