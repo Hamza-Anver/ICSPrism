@@ -53,7 +53,6 @@ pub struct DdgGraph {
 
 pub struct DdgOutputPaths {
     pub json_path: PathBuf,
-    pub dot_path: PathBuf,
 }
 
 // ---------------------------------------------------------------------------
@@ -68,13 +67,8 @@ pub fn build_and_write_ddg(
 ) -> Result<DdgOutputPaths, std::io::Error> {
     let graph = build_ddg(module, ir_text, function_filter);
     let json_path = out_prefix.with_extension("json");
-    let dot_path = out_prefix.with_extension("dot");
     std::fs::write(&json_path, graph_to_json(&graph))?;
-    std::fs::write(&dot_path, graph_to_dot(&graph))?;
-    Ok(DdgOutputPaths {
-        json_path,
-        dot_path,
-    })
+    Ok(DdgOutputPaths { json_path })
 }
 
 pub fn build_ddg(module: &Module<'_>, ir_text: &str, function_filter: Option<&str>) -> DdgGraph {
@@ -307,51 +301,4 @@ fn is_dynamic_gep(opcode: InstructionOpcode, inst: &inkwell::values::Instruction
 
 fn graph_to_json(g: &DdgGraph) -> String {
     serde_json::to_string_pretty(g).unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e))
-}
-
-fn graph_to_dot(g: &DdgGraph) -> String {
-    use std::fmt::Write;
-    let mut out = String::new();
-    let _ = writeln!(out, "digraph DDG {{");
-    let _ = writeln!(out, "  rankdir=LR;");
-    let _ = writeln!(out, "  node [shape=box fontsize=9];");
-
-    for n in &g.nodes {
-        let display = n
-            .human_name
-            .as_deref()
-            .or(n.defines.as_deref())
-            .unwrap_or("");
-        let tag = if n.has_dynamic_index {
-            " [dyn-idx]"
-        } else {
-            ""
-        };
-        let label = format!("{}\\n{}\\n{}{}", n.id, n.opcode, display, tag);
-        let _ = writeln!(out, "  n{} [label=\"{}\"];", n.id, dot_esc(&label));
-    }
-
-    for e in &g.edges {
-        let style = match e.kind.as_str() {
-            "data_memory" => " style=dashed",
-            "memory_overwrite" => " style=dotted color=red",
-            _ => "",
-        };
-        let _ = writeln!(
-            out,
-            "  n{} -> n{} [label=\"{}\"{style}];",
-            e.from,
-            e.to,
-            dot_esc(&e.kind)
-        );
-    }
-
-    let _ = writeln!(out, "}}");
-    out
-}
-
-fn dot_esc(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
 }

@@ -14,19 +14,22 @@ TARGET="$OUTDIR/$NAME"
 
 mkdir -p "$TARGET"
 
-echo "[1/8] ST -> bitcode"
+echo "[1/10] ST -> bitcode"
 $PLC -g --bc --error-format clang -o "$TARGET/$NAME.bc" "$ST"
 
-echo "[2/8] ST -> LLVM IR"
+echo "[2/10] ST -> LLVM IR"
 $PLC -g --ir --error-format clang -o "$TARGET/$NAME.ll" "$ST"
 
-echo "[3/8] Building prism-analyze"
+echo "[3/10] Building prism-analyze"
 cargo build --bin prism-analyze --manifest-path ./icsprism/Cargo.toml -q
 
-echo "[4/8] prism-analyze -> DDG + layout"
+echo "[4/10] prism-analyze -> DDG + layout"
 $ANALYZE "$TARGET/$NAME.ll" "$TARGET/$NAME"
 
-echo "[5/8] Building prism-harness"
+echo "[5/10] Rendering DDG DOT"
+python3 ./tools/ddg_to_dot.py "$TARGET/${NAME}_ddg.json" "$TARGET/${NAME}_ddg.dot"
+
+echo "[6/10] Building prism-harness"
 cargo build --bin prism-harness --manifest-path ./icsprism/Cargo.toml -q
 
 # If no program name given, detect from layout JSON
@@ -36,23 +39,23 @@ import json
 layouts = json.load(open('$TARGET/${NAME}_layout.json'))
 print(layouts[-1]['struct_name'])
 ")
-    echo "[5/8] Detected program name: $PROGRAM_NAME"
+    echo "Detected program name: $PROGRAM_NAME"
 fi
 
-echo "[5/8] Generating C harness for $PROGRAM_NAME"
+echo "[7/10] Generating C harness for $PROGRAM_NAME"
 $HARNESS "$TARGET/${NAME}_layout.json" "$PROGRAM_NAME" "$TARGET/${NAME}_harness.c"
 
-echo "[6/8] Compiling IR -> instrumented object"
+echo "[8/10] Compiling IR -> instrumented object"
 clang-21 -x ir "$TARGET/$NAME.ll" \
     -c -fsanitize-coverage=trace-pc-guard -g -O0 \
     -o "$TARGET/$NAME.o"
 
-echo "[7/8] Compiling harness"
+echo "[9/10] Compiling harness"
 clang-21 "$TARGET/${NAME}_harness.c" \
     -c -g -O0 \
     -o "$TARGET/${NAME}_harness.o"
 
-echo "[8/8] Linking -> shared library"
+echo "[10/10] Linking -> shared library"
 clang-21 "$TARGET/$NAME.o" "$TARGET/${NAME}_harness.o" \
     -shared -fPIC -g \
     -o "$TARGET/lib$NAME.so"

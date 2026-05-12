@@ -4,7 +4,6 @@ mod metadata;
 
 use inkwell::context::Context;
 use inkwell::memory_buffer::MemoryBuffer;
-use std::ffi::CString;
 use std::path::{Path, PathBuf};
 
 fn main() {
@@ -12,16 +11,13 @@ fn main() {
     if args.len() < 3 {
         eprintln!("Usage: prism-analyze <file.ll|file.bc> <output_prefix>");
         eprintln!("  output_prefix: path without extension, e.g. benchmarks/out/foo/foo");
-        eprintln!("  produces: <prefix>_layout.json, <prefix>_ddg.json, <prefix>_ddg.dot");
+        eprintln!("  produces: <prefix>_layout.json, <prefix>_ddg.json");
         std::process::exit(1);
     }
 
     let input_path = Path::new(&args[1]);
     let output_prefix = Path::new(&args[2]);
     let function_filter: Option<&str> = args.get(3).map(|s| s.as_str());
-
-    let stem = input_path.file_stem().unwrap_or_default().to_string_lossy();
-    let out_dir = input_path.parent().unwrap_or(Path::new("."));
 
     let ctx = Context::create();
 
@@ -64,7 +60,6 @@ fn main() {
     match ir_analysis::ddg::build_and_write_ddg(&module, &ir_text, function_filter, &ddg_prefix) {
         Ok(paths) => {
             println!("[+] DDG JSON: {}", paths.json_path.display());
-            println!("[+] DDG DOT:  {}", paths.dot_path.display());
 
             // Also print some stats about the graph.
             let graph = ir_analysis::build_ddg(&module, &ir_text, function_filter);

@@ -1,7 +1,8 @@
 #!/bin/bash
 # Usage: compile_all.sh <file.st> <output_dir>
 # Compiles an ST file to BC, LL, object, instrumented shared library,
-# and runs prism-analyze to produce DDG and layout JSON.
+# runs prism-analyze to produce DDG and layout JSON,
+# then renders the DDG DOT file via tools/ddg_to_dot.py.
 
 set -e
 
@@ -41,8 +42,11 @@ clang-21 "$TARGET/$NAME.o" \
 echo "[5/6] Building prism-analyze (if needed)"
 cargo build --bin prism-analyze --manifest-path ./icsprism/Cargo.toml
 
-echo "[6/6] Running prism-analyze -> DDG + layout JSON"
+echo "[6/7] Running prism-analyze -> DDG + layout JSON"
 $ANALYZE "$TARGET/$NAME.ll" "$TARGET/$NAME"
+
+echo "[7/7] Rendering DDG DOT"
+python3 ./tools/ddg_to_dot.py "$TARGET/${NAME}_ddg.json" "$TARGET/${NAME}_ddg.dot"
 
 echo ""
 echo "Output in $TARGET/"
