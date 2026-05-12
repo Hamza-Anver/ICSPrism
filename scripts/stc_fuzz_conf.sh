@@ -70,19 +70,24 @@ case "$STRATEGY" in
         )
         ;;
     prism-ddg)
+        # Produce weights.json via Python analyser then pass to prism-ddg
+        python3 "$ROOT/tools/probe_ddg_adv.py" "$TARGET/${NAME}_ddg.json" "$TARGET/${NAME}_layout.json" --json "$TARGET/${NAME}_weights.json"
         CMD=(
             cargo run --bin prism-ddg --manifest-path "$ROOT/icsprism/Cargo.toml" --
             --ddg "$TARGET/${NAME}_ddg.json"
             --layout "$TARGET/${NAME}_layout.json"
+            --weights-json "$TARGET/${NAME}_weights.json"
             --config "$CONFIG_PATH"
             "$@"
         )
         ;;
     prism-ddg-not-dumb)
+        python3 "$ROOT/tools/probe_ddg_adv.py" "$TARGET/${NAME}_ddg.json" "$TARGET/${NAME}_layout.json" --json "$TARGET/${NAME}_weights.json"
         CMD=(
             cargo run --bin prism-ddg-not-dumb --manifest-path "$ROOT/icsprism/Cargo.toml" --
             --ddg "$TARGET/${NAME}_ddg.json"
             --layout "$TARGET/${NAME}_layout.json"
+            --weights-json "$TARGET/${NAME}_weights.json"
             --config "$CONFIG_PATH"
             "$@"
         )

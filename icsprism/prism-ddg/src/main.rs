@@ -31,6 +31,7 @@ use prism_runtime::{
     execute_testcase_with_heartbeat, harness_dimensions, load_config, required_input_len,
 };
 use serde::Deserialize;
+use serde_json;
 
 // ---------------------------------------------------------------------------
 // SanitizerCoverage hooks — write into shmem so InProcessForkExecutor can
@@ -81,6 +82,9 @@ struct Args {
     #[arg(long)]
     layout: PathBuf,
 
+    #[arg(long, help = "Path to weights JSON produced by probe_ddg_adv.py (required)")]
+    weights_json: PathBuf,
+
     #[arg(short, long, default_value = "./crashes")]
     crashes: PathBuf,
 
@@ -89,31 +93,6 @@ struct Args {
 
     #[arg(long)]
     config: Option<PathBuf>,
-}
-
-// ---------------------------------------------------------------------------
-// DDG JSON schema
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct DdgNode {
-    id: u64,
-    defines: Option<String>,
-    has_dynamic_index: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct DdgEdge {
-    from: u64,
-    to: u64,
-    #[allow(dead_code)]
-    kind: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct Ddg {
-    nodes: Vec<DdgNode>,
-    edges: Vec<DdgEdge>,
 }
 
 // ---------------------------------------------------------------------------
@@ -146,77 +125,6 @@ struct ProgramLayout {
 fn is_fuzzable(field: &FieldLayout) -> bool {
     let name = field.name.as_deref().unwrap_or("");
     name != "__vtable" && !field.llvm_type.starts_with('%')
-}
-
-fn build_byte_weights(ddg: &Ddg, layout: &ProgramLayout) -> Vec<f32> {
-    let input_size = layout.total_bytes as usize;
-
-    let sinks: Vec<u64> = ddg
-        .nodes
-        .iter()
-        .filter(|n| n.has_dynamic_index)
-        .map(|n| n.id)
-        .collect();
-
-    if sinks.is_empty() {
-        println!("[prism-ddg] WARNING: no dynamic-index sinks found — using uniform weights");
-        return vec![1.0f32; input_size];
-    }
-    println!("[prism-ddg] DDG sinks: {} dynamic GEP node(s)", sinks.len());
-
-    let mut rev_adj: HashMap<u64, Vec<u64>> = HashMap::new();
-    for edge in &ddg.edges {
-        rev_adj.entry(edge.to).or_default().push(edge.from);
-    }
-
-    let mut dist: HashMap<u64, u32> = HashMap::new();
-    let mut queue: VecDeque<u64> = VecDeque::new();
-    for &s in &sinks {
-        dist.insert(s, 0);
-        queue.push_back(s);
-    }
-    while let Some(node_id) = queue.pop_front() {
-        let d = dist[&node_id];
-        if let Some(preds) = rev_adj.get(&node_id) {
-            for &pred in preds {
-                if !dist.contains_key(&pred) {
-                    dist.insert(pred, d + 1);
-                    queue.push_back(pred);
-                }
-            }
-        }
-    }
-
-    let mut name_score: HashMap<String, f32> = HashMap::new();
-    for node in &ddg.nodes {
-        if let Some(def) = &node.defines {
-            let field_name = def.trim_start_matches('%').to_string();
-            let score = dist
-                .get(&node.id)
-                .map(|&d| 1.0 / (1.0 + d as f32))
-                .unwrap_or(0.0);
-            let entry = name_score.entry(field_name).or_insert(0.0);
-            if score > *entry {
-                *entry = score;
-            }
-        }
-    }
-
-    let mut weights = vec![0.0f32; input_size];
-    for field in &layout.fields {
-        if !is_fuzzable(field) {
-            continue;
-        }
-        let name = field.name.as_deref().unwrap_or("");
-        let score = name_score.get(name).copied().unwrap_or(0.0);
-        let start = field.byte_offset as usize;
-        let end = (start + field.byte_size as usize).min(input_size);
-        for b in start..end {
-            weights[b] = score;
-        }
-    }
-
-    weights
 }
 
 fn expand_weights(weights: &[f32], required_len: usize) -> Vec<f32> {
@@ -308,11 +216,6 @@ fn main() {
     let args = Args::parse();
     let loaded = load_config(args.config.as_deref()).unwrap_or_else(|e| panic!("[prism-ddg] {e}"));
 
-    let ddg: Ddg = serde_json::from_reader(
-        File::open(&args.ddg).unwrap_or_else(|e| panic!("Cannot open {:?}: {}", args.ddg, e)),
-    )
-    .unwrap_or_else(|e| panic!("Cannot parse DDG JSON: {}", e));
-
     let layouts: Vec<ProgramLayout> = serde_json::from_reader(
         File::open(&args.layout).unwrap_or_else(|e| panic!("Cannot open {:?}: {}", args.layout, e)),
     )
@@ -330,7 +233,20 @@ fn main() {
         layout.fields.len()
     );
 
-    let base_weights = build_byte_weights(&ddg, &layout);
+    // Load precomputed byte weights produced by external Python analyser.
+    let weights_file = File::open(&args.weights_json)
+        .unwrap_or_else(|e| panic!("Cannot open weights JSON {:?}: {}", args.weights_json, e));
+    let v: serde_json::Value = serde_json::from_reader(weights_file)
+        .unwrap_or_else(|e| panic!("Cannot parse weights JSON: {}", e));
+    let byte_weights_arr = v
+        .get("byte_weights")
+        .and_then(|a| a.as_array())
+        .unwrap_or_else(|| panic!("weights JSON missing 'byte_weights' array"));
+    let mut base_weights: Vec<f32> = byte_weights_arr.iter()
+        .map(|x| x.as_f64().unwrap_or(0.0) as f32)
+        .collect();
+
+    println!("[prism-ddg] Loaded {} byte weights from {}", base_weights.len(), args.weights_json.display());
 
     println!("[prism-ddg] Field weights:");
     for field in &layout.fields {
