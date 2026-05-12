@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["ir-analysis", "prism-runtime", "prism-cov", "prism-ddg", "prism-sanity"]
+members = ["ir-analysis", "prism-runtime", "prism-cov", "prism-ddg", "prism-sanity", "prism-ddg-not-dumb"]
 
 [workspace.dependencies]
 inkwell    = { version = "0.7.0", features = ["llvm21-1"] }

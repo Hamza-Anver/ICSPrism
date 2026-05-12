@@ -255,7 +255,10 @@ fn discover_layout_path() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    if let (Ok(dir), Ok(name)) = (std::env::var("PRISM_LIB_DIR"), std::env::var("PRISM_LIB_NAME")) {
+    if let (Ok(dir), Ok(name)) = (
+        std::env::var("PRISM_LIB_DIR"),
+        std::env::var("PRISM_LIB_NAME"),
+    ) {
         let p = PathBuf::from(dir).join(format!("{name}_layout.json"));
         if p.exists() {
             return Some(p);
@@ -276,9 +279,7 @@ fn load_heartbeat_layout() -> Option<HeartbeatLayout> {
 }
 
 fn heartbeat_layout() -> Option<&'static HeartbeatLayout> {
-    HEARTBEAT_LAYOUT
-        .get_or_init(load_heartbeat_layout)
-        .as_ref()
+    HEARTBEAT_LAYOUT.get_or_init(load_heartbeat_layout).as_ref()
 }
 
 fn harness_program_name() -> Option<String> {
@@ -286,7 +287,11 @@ fn harness_program_name() -> Option<String> {
     if ptr.is_null() {
         return None;
     }
-    Some(unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
+    Some(
+        unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 fn top_level_input_flags() -> HashMap<String, bool> {

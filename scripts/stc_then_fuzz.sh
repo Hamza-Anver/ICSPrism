@@ -1,5 +1,5 @@
 #!/bin/bash
-# Usage: stc_then_fuzz.sh <st_file_or_name> <prism-cov|prism-ddg|prism-sanity> [-- <fuzzer args...>]
+# Usage: stc_then_fuzz.sh <st_file_or_name> <prism-cov|prism-ddg|prism-ddg-not-dumb|prism-sanity> [-- <fuzzer args...>]
 # Examples:
 #   ./scripts/stc_then_fuzz.sh array_lookup prism-cov
 #   ./scripts/stc_then_fuzz.sh benchmarks/harness_test_buggy.st prism-ddg -- --seeds 16 --crashes ./crashes/buggy
@@ -8,7 +8,7 @@
 set -euo pipefail
 
 if [[ $# -lt 2 ]]; then
-    echo "Usage: stc_then_fuzz.sh <st_file_or_name> <prism-cov|prism-ddg|prism-sanity> [-- <fuzzer args...>]"
+    echo "Usage: stc_then_fuzz.sh <st_file_or_name> <prism-cov|prism-ddg|prism-ddg-not-dumb|prism-sanity> [-- <fuzzer args...>]"
     exit 1
 fi
 
@@ -68,11 +68,19 @@ case "$STRATEGY" in
             "$@"
         )
         ;;
+    prism-ddg-not-dumb)
+        CMD=(
+            cargo run --bin prism-ddg-not-dumb --manifest-path "$ROOT/icsprism/Cargo.toml" --
+            --ddg "$TARGET/${NAME}_ddg.json"
+            --layout "$TARGET/${NAME}_layout.json"
+            "$@"
+        )
+        ;;
     prism-sanity)
         CMD=(cargo run --bin prism-sanity --manifest-path "$ROOT/icsprism/Cargo.toml" -- "$@")
         ;;
     *)
-        echo "Unknown strategy: $STRATEGY (expected prism-cov, prism-ddg, or prism-sanity)"
+        echo "Unknown strategy: $STRATEGY (expected prism-cov, prism-ddg, prism-ddg-not-dumb, or prism-sanity)"
         exit 1
         ;;
 esac

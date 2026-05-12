@@ -1,5 +1,5 @@
 #!/bin/bash
-# Usage: stc_fuzz_conf.sh <st_file_or_name> <prism-cov|prism-ddg|prism-sanity> <config_file> [-- <fuzzer args...>]
+# Usage: stc_fuzz_conf.sh <st_file_or_name> <prism-cov|prism-ddg|prism-ddg-not-dumb|prism-sanity> <config_file> [-- <fuzzer args...>]
 # Examples:
 #   ./scripts/stc_fuzz_conf.sh pump_controller prism-cov icsprism/prism-fuzz.toml
 #   ./scripts/stc_fuzz_conf.sh benchmarks/pump_controller.st prism-ddg icsprism/prism-fuzz-pump-seq.toml -- --seeds 64
@@ -7,7 +7,7 @@
 set -euo pipefail
 
 if [[ $# -lt 3 ]]; then
-    echo "Usage: stc_fuzz_conf.sh <st_file_or_name> <prism-cov|prism-ddg|prism-sanity> <config_file> [-- <fuzzer args...>]"
+    echo "Usage: stc_fuzz_conf.sh <st_file_or_name> <prism-cov|prism-ddg|prism-ddg-not-dumb|prism-sanity> <config_file> [-- <fuzzer args...>]"
     exit 1
 fi
 
@@ -78,12 +78,21 @@ case "$STRATEGY" in
             "$@"
         )
         ;;
+    prism-ddg-not-dumb)
+        CMD=(
+            cargo run --bin prism-ddg-not-dumb --manifest-path "$ROOT/icsprism/Cargo.toml" --
+            --ddg "$TARGET/${NAME}_ddg.json"
+            --layout "$TARGET/${NAME}_layout.json"
+            --config "$CONFIG_PATH"
+            "$@"
+        )
+        ;;
     prism-sanity)
         echo "[stc_fuzz_conf] NOTE: prism-sanity does not use --config; running without config."
         CMD=(cargo run --bin prism-sanity --manifest-path "$ROOT/icsprism/Cargo.toml" -- "$@")
         ;;
     *)
-        echo "Unknown strategy: $STRATEGY (expected prism-cov, prism-ddg, or prism-sanity)"
+        echo "Unknown strategy: $STRATEGY (expected prism-cov, prism-ddg, prism-ddg-not-dumb, or prism-sanity)"
         exit 1
         ;;
 esac
