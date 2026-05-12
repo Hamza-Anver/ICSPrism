@@ -4,15 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-libafl       = "0.15"
-libafl_bolts = "0.15"
-serde        = { version = "1", features = ["derive"] }
-serde_json   = "1"
-clap         = { version = "4", features = ["derive"] }
+libafl       = { workspace = true }
+libafl_bolts = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+clap         = { workspace = true }
 prism-runtime = { path = "../prism-runtime" }
-
-[profile.release]
-panic = "abort"
-
-[profile.dev]
-panic = "abort"

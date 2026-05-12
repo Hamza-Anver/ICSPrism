@@ -10,20 +10,21 @@ use libafl::{
     generators::RandBytesGenerator,
     inputs::{BytesInput, HasTargetBytes},
     monitors::SimpleMonitor,
-    mutators::{HavocScheduledMutator, havoc_mutations},
+    mutators::{havoc_mutations, HavocScheduledMutator},
     observers::{HitcountsMapObserver, StdMapObserver},
     schedulers::QueueScheduler,
     stages::StdMutationalStage,
     state::StdState,
 };
 use libafl_bolts::{
-    AsSliceMut,
     rands::StdRand,
     shmem::{ShMemProvider, UnixShMemProvider},
     tuples::tuple_list,
+    AsSliceMut,
 };
 use prism_runtime::{
-    execute_testcase_with_heartbeat, harness_dimensions, load_config, required_input_len,
+    execute_testcase_with_heartbeat, harness_dimensions, load_config, print_startup_diagnostics,
+    required_input_len,
 };
 
 const MAP_SIZE: usize = 65536;
@@ -80,16 +81,7 @@ fn main() {
     let in_size = dims.input_size;
     let required_len = required_input_len(&loaded.config, in_size);
 
-    println!("[prism-cov] Input frame : {} bytes", in_size);
-    println!("[prism-cov] Input total : {} bytes", required_len);
-    println!("[prism-cov] Struct      : {} bytes", dims.struct_size);
-    println!("[prism-cov] State       : {} bytes", dims.state_size);
-    println!(
-        "[prism-cov] Mode        : {:?}",
-        loaded.config.execution.mode
-    );
-    println!("[prism-cov] Config      : {}", loaded.source_label());
-    println!("[prism-cov] Crashes     : {}", args.crashes.display());
+    print_startup_diagnostics("prism-cov", &loaded, dims, required_len, &args.crashes, &[]);
 
     let mut shmem_provider = UnixShMemProvider::new().unwrap();
     let mut edges_shmem = shmem_provider.new_shmem(MAP_SIZE).unwrap();

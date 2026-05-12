@@ -4,13 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-libafl       = { version = "=0.15.4" }
-libafl_bolts = { version = "=0.15.4" }
-clap         = { version = "4", features = ["derive"] }
+libafl       = { workspace = true }
+libafl_bolts = { workspace = true }
+clap         = { workspace = true }
 prism-runtime = { path = "../prism-runtime" }
-
-[profile.release]
-panic = "abort"
-
-[profile.dev]
-panic = "abort"

@@ -143,6 +143,26 @@ pub fn harness_dimensions() -> HarnessDimensions {
     }
 }
 
+pub fn print_startup_diagnostics(
+    tag: &str,
+    loaded: &LoadedConfig,
+    dims: HarnessDimensions,
+    required_len: usize,
+    crashes: &Path,
+    extra: &[(String, String)],
+) {
+    println!("[{tag}] Input frame : {} bytes", dims.input_size);
+    println!("[{tag}] Input total : {} bytes", required_len);
+    println!("[{tag}] Struct      : {} bytes", dims.struct_size);
+    println!("[{tag}] State       : {} bytes", dims.state_size);
+    println!("[{tag}] Mode        : {:?}", loaded.config.execution.mode);
+    println!("[{tag}] Config      : {}", loaded.source_label());
+    println!("[{tag}] Crashes     : {}", crashes.display());
+    for (key, value) in extra {
+        println!("[{tag}] {key:11} : {value}");
+    }
+}
+
 struct Instance(*mut u8);
 
 impl Instance {
