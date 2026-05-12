@@ -59,7 +59,7 @@ export PRISM_LIB_NAME="$NAME"
 
 # Generate weights JSON using Python analyser
 WEIGHTS_JSON="$TARGET/${NAME}_weights.json"
-python3 "$ROOT/tools/probe_ddg_adv.py" "$TARGET/${NAME}_ddg.json" "$TARGET/${NAME}_layout.json" --json "$WEIGHTS_JSON"
+python3 "$ROOT/tools/ddg_analysis/probe_ddg_adv.py" "$TARGET/${NAME}_ddg.json" "$TARGET/${NAME}_layout.json" --json "$WEIGHTS_JSON"
 
 CMD=(cargo run --bin prism-ddg --manifest-path "$ROOT/icsprism/Cargo.toml" --
      --ddg "$TARGET/${NAME}_ddg.json"
