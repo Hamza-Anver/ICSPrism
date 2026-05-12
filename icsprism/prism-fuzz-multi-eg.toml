@@ -4,9 +4,8 @@
 mode = "scan_sequence"
 
 # Used when mode = "scan_sequence"
-cycles = 32
+cycles = 4
 warmup_cycles = 0
-max_cycles = 64
 
 # Reset PLC instance at start of each testcase
 per_testcase_reset = false

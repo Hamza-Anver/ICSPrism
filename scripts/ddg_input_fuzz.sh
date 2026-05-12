@@ -1,12 +1,12 @@
 #!/bin/bash
-# Usage: stc_prism_cov_fuzz <st_file_or_name> [config_file] [-- <fuzzer args...>]
+# Usage: ddg_input_fuzz.sh <st_file_or_name> [config_file] [-- <fuzzer args...>]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 if [[ $# -lt 1 ]]; then
-    echo "Usage: stc_prism_cov_fuzz <st_file_or_name> [config_file] [-- <fuzzer args...>]"
+    echo "Usage: ddg_input_fuzz.sh <st_file_or_name> [config_file] [-- <fuzzer args...>]"
     exit 1
 fi
 
@@ -45,19 +45,33 @@ OUTDIR="benchmarks/out"
 NAME="$(basename "$ST_PATH" .st)"
 TARGET="$OUTDIR/$NAME"
 
-echo "[stc_prism_cov_fuzz] Preparing target: $NAME"
+echo "[ddg_input_fuzz] Preparing target: $NAME"
+
+# Preserve LLVM env if set
+if [[ -z "${LLVM_SYS_211_PREFIX:-}" ]]; then
+    export LLVM_SYS_211_PREFIX=$(llvm-config-21 --prefix 2>/dev/null || true)
+fi
+
 "$ROOT/scripts/stc.sh" "$ST_PATH" "$OUTDIR"
 
 export PRISM_LIB_DIR="$ROOT/$TARGET"
 export PRISM_LIB_NAME="$NAME"
 
-CMD=(cargo run --bin prism-cov --manifest-path "$ROOT/icsprism/Cargo.toml" --)
+# Generate weights JSON using Python analyser
+WEIGHTS_JSON="$TARGET/${NAME}_weights.json"
+python3 "$ROOT/tools/probe_ddg_adv.py" "$TARGET/${NAME}_ddg.json" "$TARGET/${NAME}_layout.json" --json "$WEIGHTS_JSON"
+
+CMD=(cargo run --bin prism-ddg-input --manifest-path "$ROOT/icsprism/Cargo.toml" --
+     --ddg "$TARGET/${NAME}_ddg.json"
+     --layout "$TARGET/${NAME}_layout.json"
+     --weights-json "$WEIGHTS_JSON")
+
 if [[ -n "$CONFIG_PATH" ]]; then
     CMD+=(--config "$CONFIG_PATH")
 fi
 CMD+=("$@")
 
-echo "[stc_prism_cov_fuzz] PRISM_LIB_DIR=$PRISM_LIB_DIR"
-echo "[stc_prism_cov_fuzz] PRISM_LIB_NAME=$PRISM_LIB_NAME"
-echo "[stc_prism_cov_fuzz] Running: ${CMD[*]}"
+echo "[ddg_input_fuzz] PRISM_LIB_DIR=$PRISM_LIB_DIR"
+echo "[ddg_input_fuzz] PRISM_LIB_NAME=$PRISM_LIB_NAME"
+echo "[ddg_input_fuzz] Running: ${CMD[*]}"
 "${CMD[@]}"
