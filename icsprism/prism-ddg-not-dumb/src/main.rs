@@ -133,13 +133,24 @@ struct ProgramLayout {
 }
 
 #[derive(Debug, Deserialize)]
+struct InputFieldGuide {
+    name: String,
+    llvm_type: String,
+    byte_size: usize,
+    byte_offset: usize,
+    model: String,
+    roles: Vec<String>,
+    #[serde(default)]
+    target_values: Vec<i64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct WeightsJson {
     #[allow(dead_code)]
     main_function: String,
     #[allow(dead_code)]
     frame_size: usize,
-    #[allow(dead_code)]
-    input_fields: Vec<serde_json::Value>,
+    input_fields: Vec<InputFieldGuide>,
     byte_weights: Vec<f32>,
 }
 
@@ -554,6 +565,126 @@ where
     }
 }
 
+pub struct InputRangeMutator {
+    frame_size: usize,
+    // (offset, size, possible_values) -- possible_values contains a sequence
+    // of candidate byte-slices (each slice length == size) to write atomically
+    fields: Vec<(usize, usize, Vec<Vec<u8>>)>,
+    weights: Vec<f32>,
+    picker: WeightedIndex,
+}
+
+impl InputRangeMutator {
+    pub fn new(
+        frame_size: usize,
+        input_fields: &[InputField],
+        byte_weights: &[f32],
+    ) -> Self {
+        let mut fields = Vec::new();
+        
+        for field in input_fields {
+            let possible_values: Vec<Vec<u8>> = match &field.model {
+                FieldValueModel::Bool => vec![vec![0u8], vec![1u8]],
+                FieldValueModel::I16 { targets } => {
+                    // Convert each i16 target into its full little-endian byte pair
+                    let mut vals = Vec::new();
+                    for &target in targets {
+                        let bytes = target.to_le_bytes();
+                        vals.push(vec![bytes[0], bytes[1]]);
+                    }
+                    vals
+                }
+                FieldValueModel::Raw => continue, // Skip fields without a model
+            };
+
+            if !possible_values.is_empty() {
+                fields.push((field.offset, field.size, possible_values));
+            }
+        }
+        
+        let weights = if byte_weights.len() == frame_size {
+            byte_weights.to_vec()
+        } else {
+            vec![1.0; frame_size]
+        };
+        
+        // Build per-field weights by aggregating byte weights across the field range.
+        let mut field_weights: Vec<f32> = Vec::with_capacity(fields.len());
+        for (off, sz, _) in &fields {
+            let start = *off;
+            let end = start + *sz;
+            if start >= weights.len() {
+                field_weights.push(0.0);
+                continue;
+            }
+            let end = end.min(weights.len());
+            if start >= end {
+                field_weights.push(0.0);
+                continue;
+            }
+            let sum: f32 = weights[start..end].iter().copied().sum();
+            let avg = sum / ((end - start) as f32);
+            field_weights.push(avg.max(0.0));
+        }
+
+        let picker = WeightedIndex::new(field_weights.clone());
+
+        Self { frame_size, fields, weights, picker }
+    }
+}
+
+impl Named for InputRangeMutator {
+    fn name(&self) -> &std::borrow::Cow<'static, str> {
+        static NAME: std::sync::OnceLock<std::borrow::Cow<'static, str>> =
+            std::sync::OnceLock::new();
+        NAME.get_or_init(|| std::borrow::Cow::Borrowed("InputRangeMutator"))
+    }
+}
+
+impl<S> Mutator<BytesInput, S> for InputRangeMutator
+where
+    S: HasRand,
+{
+    fn mutate(&mut self, state: &mut S, input: &mut BytesInput) -> Result<MutationResult, Error> {
+        let bytes: &mut Vec<u8> = input.as_mut();
+        if bytes.is_empty() || self.fields.is_empty() {
+            return Ok(MutationResult::Skipped);
+        }
+        
+        // Pick a field using the weighted picker
+        let Some(field_idx) = self.picker.sample(state.rand_mut()) else {
+            return Ok(MutationResult::Skipped);
+        };
+        let (offset, size, possible_values) = &self.fields[field_idx];
+        
+        // Calculate which frame this field is in
+        let frame_count = bytes.len() / self.frame_size;
+        if frame_count == 0 {
+            return Ok(MutationResult::Skipped);
+        }
+        
+        let frame_idx = state.rand_mut().next() as usize % frame_count;
+        let base_offset = frame_idx * self.frame_size + offset;
+        
+        // Pick a random candidate and write all bytes of the candidate atomically
+        if let Some(value_idx) = pick_usize(state.rand_mut(), possible_values.len()) {
+            let value = &possible_values[value_idx];
+            // sanity: candidate length should equal field size; otherwise write up to min
+            let write_len = value.len().min(*size).min(bytes.len().saturating_sub(base_offset));
+            for i in 0..write_len {
+                bytes[base_offset + i] = value[i];
+            }
+            return Ok(MutationResult::Mutated);
+        }
+        
+        Ok(MutationResult::Skipped)
+    }
+
+    fn post_exec(&mut self, _state: &mut S, _new_corpus_id: Option<CorpusId>) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
 pub struct DdgByteMutator {
     picker: WeightedIndex,
 }
@@ -627,8 +758,8 @@ fn main() {
     let i16_targets = infer_i16_targets_from_ddg(&ddg, &dist);
     let input_fields = build_runtime_input_fields(&layout, frame_size, &name_scores, &i16_targets);
 
-    // Load weights from JSON if provided, otherwise compute from DDG
-    let base_frame_weights = if let Some(weights_path) = &args.weights_json {
+    // Load weights and input fields from JSON if provided, otherwise compute from DDG
+    let (base_frame_weights, runtime_input_fields, use_json) = if let Some(weights_path) = &args.weights_json {
         let weights_data: WeightsJson = serde_json::from_reader(
             File::open(weights_path).unwrap_or_else(|e| panic!("Cannot open {:?}: {}", weights_path, e)),
         )
@@ -641,7 +772,29 @@ fn main() {
         } else if weights_vec.len() > frame_size {
             weights_vec.truncate(frame_size);
         }
-        weights_vec
+        
+        // Build input fields from JSON guide
+        let mut json_fields = Vec::new();
+        for guide in weights_data.input_fields {
+            let model = match guide.model.as_str() {
+                "bool" => FieldValueModel::Bool,
+                "range_i16" => {
+                    let targets: Vec<i16> = guide.target_values.iter().map(|&v| v as i16).collect();
+                    FieldValueModel::I16 { targets }
+                }
+                _ => FieldValueModel::Raw,
+            };
+            
+            json_fields.push(InputField {
+                name: guide.name,
+                offset: guide.byte_offset,
+                size: guide.byte_size,
+                model,
+                ddg_score: 0.5,
+            });
+        }
+        
+        (weights_vec, json_fields, true)
     } else {
         // Fall back to DDG-based analysis
         let mut base_weights = vec![0.0f32; frame_size];
@@ -656,7 +809,7 @@ fn main() {
                 *w = score;
             }
         }
-        base_weights
+        (base_weights, input_fields.clone(), false)
     };
 
     let weights = expand_weights_for_sequence(&base_frame_weights, required_len);
@@ -692,14 +845,18 @@ fn main() {
     );
     println!(
         "[prism-ddg-not-dumb] Input fields  : {}",
-        input_fields.len()
+        runtime_input_fields.len()
     );
-    for field in &input_fields {
+    for field in &runtime_input_fields {
         println!(
             "[prism-ddg-not-dumb]   {:20} off={:>2} size={:>2} score={:.4}",
             field.name, field.offset, field.size, field.ddg_score
         );
     }
+    println!(
+        "[prism-ddg-not-dumb] Weights src   : {}",
+        if use_json { "JSON (probe_ddg_adv.py)" } else { "DDG analysis" }
+    );
     println!(
         "[prism-ddg-not-dumb] Config        : {}",
         loaded.source_label()
@@ -771,11 +928,12 @@ fn main() {
         )
         .unwrap();
 
-    let field_mutator = FieldValueMutator::new(frame_size, input_fields.clone());
-    let frame_mutator = FramePatternMutator::new(frame_size, &input_fields);
+    let field_mutator = FieldValueMutator::new(frame_size, runtime_input_fields.clone());
+    let frame_mutator = FramePatternMutator::new(frame_size, &runtime_input_fields);
+    let range_mutator = InputRangeMutator::new(frame_size, &runtime_input_fields, &base_frame_weights);
     let ddg_mutator = DdgByteMutator::new(weights);
     let mutator = HavocScheduledMutator::new(
-        tuple_list!(field_mutator, frame_mutator, ddg_mutator).merge(havoc_mutations()),
+        tuple_list!(field_mutator, frame_mutator, range_mutator, ddg_mutator).merge(havoc_mutations()),
     );
     let mut stages = tuple_list!(StdMutationalStage::new(mutator));
 
