@@ -134,7 +134,9 @@ struct ProgramLayout {
 
 #[derive(Debug, Deserialize)]
 struct WeightsJson {
+    #[allow(dead_code)]
     main_function: String,
+    #[allow(dead_code)]
     frame_size: usize,
     #[allow(dead_code)]
     input_fields: Vec<serde_json::Value>,
