@@ -4,8 +4,7 @@
 # Full pipeline for prism-ddg-state:
 #   1. Compile ST → shared library + harness (stc.sh)
 #   2. Generate byte-weight + input-field guide  (probe_ddg_adv.py)
-#   3. Generate state-hash config               (ddg_state_hash_heuristics.py)
-#   4. Launch prism-ddg-state with both configs
+#   3. Launch prism-ddg-state with generated heuristics + weights
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -62,7 +61,7 @@ export PRISM_LIB_DIR="$ROOT/$TARGET"
 export PRISM_LIB_NAME="$NAME"
 
 WEIGHTS_JSON="$TARGET/${NAME}_weights.json"
-STATE_HASH_JSON="$TARGET/${NAME}_state_hash.json"
+STATE_HASH_JSON="$TARGET/${NAME}_harness_heuristics.json"
 
 echo "[ddg_state] Generating input-field weights..."
 python3 "$ROOT/tools/ddg_analysis/probe_ddg_adv.py" \
@@ -70,11 +69,10 @@ python3 "$ROOT/tools/ddg_analysis/probe_ddg_adv.py" \
     "$TARGET/${NAME}_layout.json" \
     --json "$WEIGHTS_JSON"
 
-echo "[ddg_state] Generating state-hash config..."
-python3 "$ROOT/tools/ddg_analysis/ddg_state_hash_heuristics.py" \
-    "$TARGET/${NAME}_ddg.json" \
-    "$TARGET/${NAME}_layout.json" \
-    --json "$STATE_HASH_JSON"
+if [[ ! -f "$STATE_HASH_JSON" ]]; then
+    echo "[ddg_state] Missing harness heuristics JSON: $STATE_HASH_JSON"
+    exit 1
+fi
 
 CMD=(cargo run --bin prism-ddg-state --manifest-path "$ROOT/icsprism/Cargo.toml" --
      --ddg     "$TARGET/${NAME}_ddg.json"

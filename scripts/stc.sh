@@ -11,6 +11,7 @@ PLC="./rusty/target/debug/plc"
 ANALYZE="./icsprism/target/debug/prism-analyze"
 HARNESS="./icsprism/target/debug/prism-harness"
 TARGET="$OUTDIR/$NAME"
+ABS_TARGET="$(cd "$(dirname "$TARGET")" && pwd)/$(basename "$TARGET")"
 
 mkdir -p "$TARGET"
 
@@ -45,17 +46,23 @@ fi
 echo "[7/10] Generating C harness for $PROGRAM_NAME"
 $HARNESS "$TARGET/${NAME}_layout.json" "$PROGRAM_NAME" "$TARGET/${NAME}_harness.c"
 
-echo "[8/10] Compiling IR -> instrumented object"
+echo "[8/11] Saving harness heuristics JSON"
+python3 ./tools/ddg_analysis/ddg_state_hash_heuristics.py \
+    "$TARGET/${NAME}_ddg.json" \
+    "$TARGET/${NAME}_layout.json" \
+    --json "$TARGET/${NAME}_harness_heuristics.json"
+
+echo "[9/11] Compiling IR -> instrumented object"
 clang-21 -x ir "$TARGET/$NAME.ll" \
     -c -fsanitize-coverage=trace-pc-guard -g -O0 \
     -o "$TARGET/$NAME.o"
 
-echo "[9/10] Compiling harness"
+echo "[10/11] Compiling harness"
 clang-21 "$TARGET/${NAME}_harness.c" \
     -c -g -O0 \
     -o "$TARGET/${NAME}_harness.o"
 
-echo "[10/10] Linking -> shared library"
+echo "[11/11] Linking -> shared library"
 clang-21 "$TARGET/$NAME.o" "$TARGET/${NAME}_harness.o" \
     -shared -fPIC -g \
     -o "$TARGET/lib$NAME.so"
@@ -65,4 +72,4 @@ echo "Output in $TARGET/"
 ls -lh "$TARGET/"
 echo "Program name: $PROGRAM_NAME"
 echo "Run with:"
-echo "  PRISM_LIB_DIR=/workspaces/ICSPrism/$TARGET PRISM_LIB_NAME=$NAME cargo build --bin prism-cov --manifest-path icsprism/Cargo.toml"
+echo "  PRISM_LIB_DIR=$ABS_TARGET PRISM_LIB_NAME=$NAME cargo build --bin prism-cov --manifest-path icsprism/Cargo.toml"
