@@ -116,8 +116,10 @@ CASE Mode OF
         // Requires entering RUN, then building enough history so Offset becomes large.
         // Input-only fuzzing with frequent resets should struggle more than stateful fuzzing.
         IF Buffer[1] > 1 THEN
-            prism_bug_abort_if(1, 9001);
             Buffer[Offset] := 1234;
+            IF Offset > 7 THEN
+                prism_bug_abort_if(1, 9001);
+            END_IF;
         END_IF;
 
         IF CmdReset THEN

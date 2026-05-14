@@ -1,3 +1,11 @@
+{external}
+FUNCTION prism_bug_abort_if : DINT
+VAR_INPUT
+    should_abort : DINT;
+    bug_id       : DINT;
+END_VAR
+END_FUNCTION
+
 // pipeline_controller — industrial pipeline fill process controller
 //
 // Bug: Buffer[FillHead] OOB write when FillHead >= 64 (Buffer is [0..63]).
@@ -337,6 +345,9 @@ CASE Phase OF
         // FillHead >= 64 writes out of bounds.
         // FillHead appears ONLY here — no comparison against 64 anywhere.
         Buffer[FillHead] := CycleCount;
+        IF FillHead > 63 THEN
+            prism_bug_abort_if(1, 9001);
+        END_IF;
 
 END_CASE;
 

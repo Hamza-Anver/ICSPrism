@@ -562,6 +562,119 @@ fn expand_weights_for_sequence(base_weights: &[f32], required_len: usize) -> Vec
 // Mutators
 // ---------------------------------------------------------------------------
 
+/// Creates a "joint-good frame" where all important driver fields are set to
+/// satisfying values simultaneously, then stamps it across a long run.
+///
+/// This is the primary fix for joint-constraint bugs: independent field-by-field
+/// mutators can find good values for each field separately but rarely produce a
+/// single frame where ALL driver fields are simultaneously correct.  This mutator
+/// creates that frame in one step by sampling target_values for every I16 field
+/// and setting inhibitors to 0, then copies the frame across ≥9 consecutive
+/// frames so the accumulation window is long enough to matter.
+struct AccumulationWindowMutator {
+    frame_size: usize,
+    /// (frame_offset, candidates) for each driver field.
+    driver_fields: Vec<(usize, Vec<Vec<u8>>)>,
+    /// Frame offsets of inhibitor bool fields (must stay 0).
+    inhibitor_offsets: Vec<usize>,
+    /// Minimum window length in frames.
+    min_window: usize,
+}
+
+impl AccumulationWindowMutator {
+    fn new(frame_size: usize, fields: &[InputField]) -> Self {
+        let driver_fields = fields
+            .iter()
+            .filter(|f| f.role != FieldRole::Inhibitor)
+            .filter_map(|f| match &f.model {
+                FieldValueModel::I16 { targets } if !targets.is_empty() => {
+                    let candidates: Vec<Vec<u8>> =
+                        targets.iter().map(|&v| v.to_le_bytes().to_vec()).collect();
+                    Some((f.offset, candidates))
+                }
+                FieldValueModel::Bool if f.role == FieldRole::Activator => {
+                    Some((f.offset, vec![vec![1u8]]))
+                }
+                _ => None,
+            })
+            .collect();
+        let inhibitor_offsets = fields
+            .iter()
+            .filter_map(|f| (f.role == FieldRole::Inhibitor).then_some(f.offset))
+            .collect();
+        Self {
+            frame_size,
+            driver_fields,
+            inhibitor_offsets,
+            min_window: 9,
+        }
+    }
+}
+
+impl Named for AccumulationWindowMutator {
+    fn name(&self) -> &std::borrow::Cow<'static, str> {
+        static N: std::sync::OnceLock<std::borrow::Cow<'static, str>> =
+            std::sync::OnceLock::new();
+        N.get_or_init(|| std::borrow::Cow::Borrowed("AccumulationWindowMutator"))
+    }
+}
+
+impl<S> Mutator<BytesInput, S> for AccumulationWindowMutator
+where
+    S: HasRand,
+{
+    fn mutate(&mut self, state: &mut S, input: &mut BytesInput) -> Result<MutationResult, Error> {
+        if self.frame_size == 0 || self.driver_fields.is_empty() {
+            return Ok(MutationResult::Skipped);
+        }
+        let bytes: &mut Vec<u8> = input.as_mut();
+        let frame_count = bytes.len() / self.frame_size;
+        if frame_count < self.min_window {
+            return Ok(MutationResult::Skipped);
+        }
+
+        // Build a "joint-good frame" from scratch — sample one target value per driver field.
+        let mut good_frame = vec![0u8; self.frame_size];
+        for (off, candidates) in &self.driver_fields {
+            let Some(vi) = pick_usize(state.rand_mut(), candidates.len()) else {
+                continue;
+            };
+            let val = &candidates[vi];
+            let write_len = val.len().min(self.frame_size.saturating_sub(*off));
+            good_frame[*off..*off + write_len].copy_from_slice(&val[..write_len]);
+        }
+        // Inhibitors always stay 0 (already the case since we zeroed the frame).
+
+        // Choose a window length ≥ min_window frames.
+        let max_window = frame_count;
+        let window_len = self.min_window
+            + (state.rand_mut().next() as usize) % (max_window - self.min_window + 1);
+
+        // Choose a start position that fits the window.
+        let Some(window_start) =
+            pick_usize(state.rand_mut(), frame_count.saturating_sub(window_len) + 1)
+        else {
+            return Ok(MutationResult::Skipped);
+        };
+        let window_end = (window_start + window_len).min(frame_count);
+
+        // Stamp the joint-good frame across the chosen window.
+        for f in window_start..window_end {
+            let d_start = f * self.frame_size;
+            bytes[d_start..d_start + self.frame_size].copy_from_slice(&good_frame);
+        }
+        Ok(MutationResult::Mutated)
+    }
+
+    fn post_exec(
+        &mut self,
+        _state: &mut S,
+        _new_corpus_id: Option<CorpusId>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
 /// Picks a field by DDG score and writes a semantically-appropriate value.
 struct FieldValueMutator {
     frame_size: usize,
@@ -1196,10 +1309,11 @@ fn main() {
     let frame_mutator = FramePatternMutator::new(frame_size, &runtime_input_fields);
     let range_mutator =
         InputRangeMutator::new(frame_size, &runtime_input_fields, &base_frame_weights);
+    let window_mutator = AccumulationWindowMutator::new(frame_size, &runtime_input_fields);
     let ddg_mutator = DdgByteMutator::new(weights);
 
     let mutator = HavocScheduledMutator::new(
-        tuple_list!(field_mutator, frame_mutator, range_mutator, ddg_mutator)
+        tuple_list!(field_mutator, frame_mutator, range_mutator, window_mutator, ddg_mutator)
             .merge(havoc_mutations()),
     );
     let mut stages = tuple_list!(StdMutationalStage::new(mutator));

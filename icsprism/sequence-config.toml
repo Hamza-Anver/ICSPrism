@@ -4,11 +4,11 @@
 mode = "scan_sequence"
 
 # Used when mode = "scan_sequence"
-cycles = 32
+cycles = 64
 warmup_cycles = 0
 
 # Reset PLC instance at start of each testcase
-per_testcase_reset = false
+per_testcase_reset = true
 
 # Executor timeout per testcase
 timeout_ms = 5000

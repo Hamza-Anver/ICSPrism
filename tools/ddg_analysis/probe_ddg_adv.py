@@ -323,6 +323,60 @@ def _resolve_stored_field(nid: int, G: nx.DiGraph) -> str | None:
     return None
 
 
+def _resolve_br_guard(br_id: int, G: nx.DiGraph) -> tuple | None:
+    """
+    Find the first resolvable range ICmp that guards a Br node.
+
+    Handles both simple guards (Br ← ICmp) and compound AND guards compiled as:
+      Br ← ICmp(ne,0) ← ZExt ← And ← [ZExt ← ICmp(sgt), ZExt ← ICmp(slt)]
+
+    When a ne/eq wrapper is encountered, we look deeper to find the underlying
+    range comparison (sgt/sge/slt/sle), which is the meaningful guard for
+    accumulation chain analysis.  Returns the first such range guard found.
+    """
+    def _walk(nid: int, depth: int) -> tuple | None:
+        if depth > 5:
+            return None
+        node = G.nodes[nid]
+        op = node.get("opcode", "")
+
+        if op == "ICmp":
+            resolved = resolve_icmp(nid, G)
+            if not resolved:
+                # ICmp unresolvable at this level — walk into predecessors.
+                for pred in G.predecessors(nid):
+                    r = _walk(pred, depth + 1)
+                    if r:
+                        return r
+                return None
+            gfield, gpred, gthresh = resolved
+            if gfield in _NOISE_GUARD_FIELDS:
+                return None
+            # If this is a boolean-cast ne/eq 0 wrapper (artefact of compound AND),
+            # try to find a real range comparison deeper in the graph.
+            if gpred in ("ne", "eq") and gthresh in (0, 1):
+                for pred in G.predecessors(nid):
+                    r = _walk(pred, depth + 1)
+                    if r and r[1] not in ("ne", "eq"):
+                        return r  # prefer a real range guard over the wrapper
+                # No range guard found deeper; return wrapper as fallback.
+                return resolved
+            return resolved
+
+        if op in ("And", "Or", "ZExt", "SExt", "Trunc"):
+            for pred in G.predecessors(nid):
+                r = _walk(pred, depth + 1)
+                if r:
+                    return r
+        return None
+
+    for cond_id in G.predecessors(br_id):
+        result = _walk(cond_id, 0)
+        if result:
+            return result
+    return None
+
+
 def find_store_guards(G: nx.DiGraph, func: str,
                       abort_bbs: set[str] | None = None) -> list:
     """
@@ -356,18 +410,7 @@ def find_store_guards(G: nx.DiGraph, func: str,
                 continue
             if store_bb not in br_data.get("ir", ""):
                 continue
-            for cond_id in G.predecessors(br_id):
-                if G.nodes[cond_id].get("opcode") != "ICmp":
-                    continue
-                resolved = resolve_icmp(cond_id, G)
-                if not resolved:
-                    continue
-                gfield, gpred, gthresh = resolved
-                # Skip guards from loop-counter fields
-                if gfield in _NOISE_GUARD_FIELDS:
-                    continue
-                guard = resolved
-                break
+            guard = _resolve_br_guard(br_id, G)
             if guard:
                 break
 
@@ -557,17 +600,43 @@ def classify_input(field: dict, all_icmps: list, chain: list,
     )
     critical = in_chain_guard or "inhibitor" in roles or "driver" in roles
 
-    # Interesting target values: cluster around each comparison threshold
+    # Interesting target values: cluster around each comparison threshold.
+    # Also include a few spread-out satisfying values so the mutator has a
+    # decent probability of landing in the satisfying range, not just on the
+    # boundary.
     targets_set: set[int] = set()
     for pred, thresh in comparisons:
         if pred in ("sgt", "sge"):
-            targets_set.update([thresh, thresh + 1, thresh + 2])
-            if thresh > 0:
-                targets_set.add(thresh - 1)
+            # Boundary values (near the threshold)
+            targets_set.update([thresh - 1, thresh, thresh + 1, thresh + 2])
+            # A few satisfying interior values away from the boundary
+            targets_set.update([thresh + 5, thresh + 10])
         elif pred in ("slt", "sle"):
+            # Boundary values
             targets_set.update([thresh - 2, thresh - 1, thresh, thresh + 1])
+            # A few satisfying interior values
+            if thresh > 10:
+                targets_set.update([thresh - 5, thresh - 10])
         elif pred in ("ne", "eq"):
             targets_set.update([0, 1])
+
+    # Window interior: when a field has both a lower-bound (sgt/sge N) and an
+    # upper-bound (slt/sle M) forming a satisfying window (N < M), the boundary
+    # values alone leave most of the window unsampled.  Add the midpoint and
+    # quarter-points so the InputRangeMutator can hit the interior.
+    lower_bounds = [(p, t) for p, t in comparisons if p in ("sgt", "sge")]
+    upper_bounds = [(p, t) for p, t in comparisons if p in ("slt", "sle")]
+    for lp, lt in lower_bounds:
+        for up, ut in upper_bounds:
+            lo = lt + (1 if lp == "sgt" else 0)  # first satisfying value
+            hi = ut - (1 if up == "slt" else 0)  # last satisfying value
+            if lo >= hi or hi - lo < 3:
+                continue
+            mid = (lo + hi) // 2
+            targets_set.add(mid)
+            if hi - lo >= 6:
+                targets_set.add(lo + (hi - lo) // 4)
+                targets_set.add(lo + 3 * (hi - lo) // 4)
 
     # For inhibitors: always include 0 (keep inactive)
     if "inhibitor" in roles:
