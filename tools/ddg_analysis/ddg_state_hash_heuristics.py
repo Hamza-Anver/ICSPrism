@@ -14,6 +14,10 @@ Two selection arms:
                      array accesses).  These cause the vulnerability even
                      if they are never compared.
 
+Array elements:  when a comparison uses a constant array index (e.g.
+  Buffer[0] > 2, Buffer[1] > 1), both elements are tracked separately
+  with their own offsets, thresholds, and bucket counts.
+
 Usage:
     python3 ddg_state_hash_heuristics.py <ddg.json> <layout.json> [--json out.json]
 """
@@ -25,7 +29,7 @@ import networkx as nx
 
 
 # ---------------------------------------------------------------------------
-# Graph helpers (minimal reimplementation, no import from sibling scripts)
+# Graph helpers
 # ---------------------------------------------------------------------------
 
 def build_graph(ddg: dict) -> nx.DiGraph:
@@ -52,8 +56,41 @@ def _is_named_field_gep(node: dict) -> str | None:
     return name
 
 
+def _get_constant_array_index(gep_ir: str) -> int | None:
+    """
+    Extract constant element index from a constant-index array GEP, e.g.:
+      getelementptr inbounds [8 x i16], ptr %Buffer, i32 0, i32 1  →  1
+    Returns None for dynamic indices or non-array GEPs.
+    """
+    m = re.search(
+        r'getelementptr\b[^%\[]*\[\d+\s+x\s+\w+\],\s*ptr\s+\S+,\s*i\d+\s+\d+,\s*i\d+\s+(-?\d+)',
+        gep_ir
+    )
+    return int(m.group(1)) if m else None
+
+
+def _field_key(fname: str, idx: int | None) -> str:
+    """Format a (name, index) pair as the dict key used throughout analysis."""
+    return f"{fname}[{idx}]" if idx is not None else fname
+
+
+# ---------------------------------------------------------------------------
+# Field resolution — scalar and array-element aware
+# ---------------------------------------------------------------------------
+
 def resolve_to_field(start_id: int, G: nx.DiGraph) -> str | None:
-    """Walk backwards through the graph to find a named struct GEP."""
+    """Walk backwards through the graph to find a named struct GEP (base name only)."""
+    r = resolve_to_field_indexed(start_id, G)
+    return r[0] if r else None
+
+
+def resolve_to_field_indexed(start_id: int, G: nx.DiGraph) -> tuple[str, int | None] | None:
+    """
+    Walk backwards through the graph to find a named struct GEP.
+    Returns (field_name, element_index_or_None).
+    element_index is set when the Load comes through a constant-index array GEP
+    (e.g. Buffer[0] or Buffer[1]); None for scalar fields or dynamic-index accesses.
+    """
     visited: set[int] = set()
     queue = deque([start_id])
     while queue:
@@ -67,31 +104,33 @@ def resolve_to_field(start_id: int, G: nx.DiGraph) -> str | None:
                 pn = G.nodes[pred]
                 fname = _is_named_field_gep(pn)
                 if fname:
-                    return fname
-                # array-element GEP: base pointer is one more level back
+                    return (fname, None)  # scalar struct field
+                # array-element GEP: base pointer is one level back
                 if pn.get("opcode") == "GetElementPtr":
+                    elem_idx = _get_constant_array_index(pn.get("ir", ""))
                     for bp in G.predecessors(pred):
                         bfname = _is_named_field_gep(G.nodes[bp])
                         if bfname:
-                            return bfname
+                            return (bfname, elem_idx)  # array element (constant or dynamic idx)
         for pred in G.predecessors(nid):
             if pred not in visited:
                 queue.append(pred)
     return None
 
 
-def _resolve_stored_field(nid: int, G: nx.DiGraph) -> str | None:
-    """Identify the struct field a Store instruction writes to."""
+def _resolve_stored_field_indexed(nid: int, G: nx.DiGraph) -> tuple[str, int | None] | None:
+    """Identify the struct field (and optional element index) a Store writes to."""
     for pred in G.predecessors(nid):
         pn = G.nodes[pred]
         fname = _is_named_field_gep(pn)
         if fname:
-            return fname
+            return (fname, None)
         if pn.get("opcode") == "GetElementPtr":
+            elem_idx = _get_constant_array_index(pn.get("ir", ""))
             for bp in G.predecessors(pred):
                 bfname = _is_named_field_gep(G.nodes[bp])
                 if bfname:
-                    return bfname
+                    return (bfname, elem_idx)
     return None
 
 
@@ -141,21 +180,30 @@ def find_main_func(G: nx.DiGraph) -> str:
 
 
 def get_stored_fields(G: nx.DiGraph, func: str) -> set[str]:
-    """Fields that are stored to within the function — these are state vars."""
-    stored = set()
+    """
+    Returns the set of field keys (base name or "array[idx]") stored within
+    the function.  A base name ("Buffer") is added whenever a dynamic-index
+    Store is detected; element keys ("Buffer[0]") are added for constant-index
+    Stores.  This ensures array state vars are never mis-classified as inputs.
+    """
+    stored: set[str] = set()
     for nid, data in G.nodes(data=True):
-        if data.get("opcode") == "Store" and data.get("function") == func:
-            fname = _resolve_stored_field(nid, G)
-            if fname:
-                stored.add(fname)
+        if data.get("opcode") != "Store" or data.get("function") != func:
+            continue
+        r = _resolve_stored_field_indexed(nid, G)
+        if not r:
+            continue
+        fname, idx = r
+        stored.add(fname)                  # base name always
+        stored.add(_field_key(fname, idx)) # indexed key (== base when idx is None)
     return stored
 
 
 def get_comparisons_by_field(G: nx.DiGraph, func: str) -> dict[str, list]:
     """
-    For each field that appears in an ICmp or Switch, collect all
-    (pred, threshold) pairs.  Returns only fields with at least one
-    resolved comparison.
+    For each field (or array element) that appears in an ICmp or Switch, collect
+    all (pred, threshold) pairs.  Returns {field_key: [(pred, threshold)]}.
+    Array elements get keys like "Buffer[0]" when the array index is a constant.
     """
     result: dict[str, list] = defaultdict(list)
     seen: set[tuple] = set()
@@ -172,12 +220,14 @@ def get_comparisons_by_field(G: nx.DiGraph, func: str) -> dict[str, list]:
         if not re.match(r"^-?\d+$", rhs):
             continue
         threshold = int(rhs)
-        field = resolve_to_field(root_id, G)
-        if field:
-            key = (field, pred, threshold)
-            if key not in seen:
-                seen.add(key)
-                result[field].append((pred, threshold))
+        r = resolve_to_field_indexed(root_id, G)
+        if r:
+            fname, idx = r
+            key = _field_key(fname, idx)
+            entry = (key, pred, threshold)
+            if entry not in seen:
+                seen.add(entry)
+                result[key].append((pred, threshold))
 
     # Switch nodes — each case value is a threshold
     for nid, data in G.nodes(data=True):
@@ -187,15 +237,16 @@ def get_comparisons_by_field(G: nx.DiGraph, func: str) -> dict[str, list]:
         cases = [int(v) for v in re.findall(r"i\d+\s+(-?\d+),\s*label", ir)]
         if not cases:
             continue
-        # Find the field the switch dispatches on
         for pred_id in G.predecessors(nid):
-            field = resolve_to_field(pred_id, G)
-            if field:
+            r = resolve_to_field_indexed(pred_id, G)
+            if r:
+                fname, idx = r
+                key = _field_key(fname, idx)
                 for v in cases:
-                    key = (field, "eq", v)
-                    if key not in seen:
-                        seen.add(key)
-                        result[field].append(("eq", v))
+                    entry = (key, "eq", v)
+                    if entry not in seen:
+                        seen.add(entry)
+                        result[key].append(("eq", v))
                 break
 
     return dict(result)
@@ -213,17 +264,15 @@ def get_gep_sink_fields(G: nx.DiGraph, func: str) -> dict[str, list]:
     if not sinks:
         return {}
 
-    # Collect array sizes from each sink's GEP IR
     sink_sizes: dict[int, int | None] = {}
     for sid in sinks:
         ir = G.nodes[sid].get("ir", "")
         m = re.search(r"\[(\d+)\s+x\s+", ir)
         sink_sizes[sid] = int(m.group(1)) if m else None
 
-    # BFS backwards from all sinks
     visited: set[int] = set()
     q = deque(sinks)
-    reached_from: dict[int, set[int]] = defaultdict(set)  # node -> which sinks reached it
+    reached_from: dict[int, set[int]] = defaultdict(set)
     for sid in sinks:
         reached_from[sid].add(sid)
 
@@ -237,7 +286,6 @@ def get_gep_sink_fields(G: nx.DiGraph, func: str) -> dict[str, list]:
                 reached_from[pred] |= reached_from[nid]
                 q.append(pred)
 
-    # Collect named fields reached and which array sizes are relevant
     result: dict[str, set] = defaultdict(set)
     for nid in visited:
         node = G.nodes[nid]
@@ -255,20 +303,23 @@ def get_gep_sink_fields(G: nx.DiGraph, func: str) -> dict[str, list]:
             if fname:
                 for sid in reached_from[nid]:
                     sz = sink_sizes.get(sid)
-                    if sz is not None:
-                        result[fname].add(sz)
-                    else:
-                        result[fname].add(0)
+                    result[fname].add(sz if sz is not None else 0)
 
     return {k: sorted(v) for k, v in result.items()}
 
 
-def has_reset_stores(field: str, G: nx.DiGraph, func: str) -> bool:
-    """True if the field is ever stored with a literal constant (reset pattern)."""
+def has_reset_stores(field_key: str, G: nx.DiGraph, func: str) -> bool:
+    """True if the field (or its base array) is ever stored with a literal constant."""
+    # Accept both "Buffer" and "Buffer[0]" — strip the index to get the base name
+    base_name = re.sub(r'\[\d+\]$', '', field_key)
     for nid, data in G.nodes(data=True):
         if data.get("opcode") != "Store" or data.get("function") != func:
             continue
-        if _resolve_stored_field(nid, G) != field:
+        r = _resolve_stored_field_indexed(nid, G)
+        if not r:
+            continue
+        fname, _ = r
+        if fname != base_name:
             continue
         ir = data.get("ir", "")
         if re.search(r"store\s+\w+\s+-?\d+,", ir):
@@ -279,8 +330,7 @@ def has_reset_stores(field: str, G: nx.DiGraph, func: str) -> bool:
 def is_loop_variable(field: str, comparisons: list) -> bool:
     """
     Heuristic: a field is a loop counter if it has BOTH a lower-bound
-    (slt/sle) AND an upper-bound (sgt/sge) comparison.  Loop counters
-    are uninteresting for state hashing because they reset every invocation.
+    (slt/sle) AND an upper-bound (sgt/sge) comparison.
     """
     preds = {p for p, _ in comparisons}
     has_upper = bool(preds & {"sgt", "sge"})
@@ -303,69 +353,89 @@ def _bucket_config_for_switch(case_values: list) -> dict:
     }
 
 
+def _firing_value(pred: str, threshold: int) -> int | None:
+    """
+    Return the smallest value v where pred(v, threshold) is True.
+    Only meaningful for upper-bound predicates (sgt, sge) that mark
+    accumulation milestones.  Returns None for lower-bound predicates.
+    """
+    if pred == "sge":
+        return threshold       # v >= threshold  →  fires at threshold
+    if pred == "sgt":
+        return threshold + 1   # v >  threshold  →  fires at threshold+1
+    return None
+
+
 def _bucket_config_for_icmp(comparisons: list) -> dict:
     """
     ICmp-gated accumulator.
 
-    For small thresholds (≤ 32): fine-grained below the threshold so
-    every increment is a new bucket.  Layout: {0, 1, …, T-1, ≥T}.
+    Bucket count is derived from the highest FIRING VALUE across all
+    upper-bound comparisons:
+      sge N  →  fires at N   →  N+1 buckets  {0, 1, …, N-1, ≥N}
+      sgt N  →  fires at N+1 →  N+2 buckets  {0, 1, …, N,   ≥N+1}
 
-    For large thresholds (> 32): log2-spaced to keep bucket count sane.
-
-    Boolean-cast artefacts (ne/eq against 0 or 1) are dropped when real
-    range comparisons (sgt/sge/slt/sle) are present — they add no bucketing
-    information beyond what the range comparison already captures.
+    For small firing values (≤ 32): fine-grained so every increment is
+    a distinct bucket.
+    For large firing values (> 32): log2-spaced to keep bucket count sane.
     """
     range_preds = {"sgt", "sge", "slt", "sle"}
     has_range = any(p in range_preds for p, _ in comparisons)
 
     if has_range:
-        # Drop ne/eq comparisons — they're boolean casts of range results.
+        # Drop ne/eq — they're boolean casts of range results.
         effective = [(p, t) for p, t in comparisons if p in range_preds]
     else:
         effective = comparisons
 
-    # Use the highest non-negative threshold.
-    thresholds = sorted({t for _, t in effective if t >= 0})
-    if not thresholds:
-        return {"scheme": "binary", "thresholds": [0], "bucket_count": 2,
-                "note": "no non-negative threshold found, fallback binary"}
+    firing_values = [
+        fv for p, t in effective
+        for fv in [_firing_value(p, t)]
+        if fv is not None and fv >= 0
+    ]
 
-    max_thresh = max(thresholds)
+    if not firing_values:
+        # Only lower-bound or ne/eq comparisons — minimal useful bucketing
+        thresholds = sorted({t for _, t in effective if t >= 0})
+        if not thresholds:
+            return {"scheme": "binary", "thresholds": [0], "bucket_count": 2,
+                    "note": "no non-negative threshold found, fallback binary"}
+        return {"scheme": "binary", "thresholds": thresholds, "bucket_count": 2,
+                "note": f"lower-bound only comparisons, binary split at {thresholds[0]}"}
 
-    if max_thresh <= 32:
-        # One bucket per value 0..max_thresh-1, plus one ≥max_thresh bucket.
-        count = max_thresh + 1
+    max_fv = max(firing_values)
+    thresholds_out = sorted({t for _, t in effective if t >= 0})
+
+    if max_fv <= 32:
+        # One bucket per value 0..max_fv-1, plus one ≥max_fv bucket.
+        count = max_fv + 1
         return {
             "scheme": "threshold_fine",
-            "thresholds": thresholds,
+            "thresholds": thresholds_out,
             "bucket_count": count,
-            "note": f"fine-grained 0..{max_thresh-1} + ≥{max_thresh} ({count} buckets)",
+            "note": f"fine-grained 0..{max_fv-1} + ≥{max_fv} ({count} buckets)",
         }
     else:
-        # Log2-spaced boundaries.
         boundaries = []
         b = 1
-        while b < max_thresh:
+        while b < max_fv:
             boundaries.append(b)
             b *= 2
-        boundaries.append(max_thresh)
+        boundaries.append(max_fv)
         return {
             "scheme": "threshold_log2",
             "thresholds": boundaries,
             "bucket_count": len(boundaries) + 1,
-            "note": f"log2-spaced up to {max_thresh} ({len(boundaries)+1} buckets)",
+            "note": f"log2-spaced up to {max_fv} ({len(boundaries)+1} buckets)",
         }
 
 
 def _bucket_config_for_gep(array_sizes: list) -> dict:
     """
-    Danger-arm variable (no comparison, feeds into dynamic GEP).
+    Danger-arm variable (no or only lower-bound comparisons, feeds dynamic GEP).
 
     If the array bound is known and ≤ 64: raw_capped — every value from
-    0 to bound is its own bucket, ≥bound+1 is the OOB bucket.  This
-    gives maximum gradient toward the vulnerability because each
-    increment is distinct progress.
+    0 to bound is its own bucket, ≥bound+1 is the OOB bucket.
 
     If bound > 64 or unknown: quartile (4 equal-width buckets + OOB).
     """
@@ -376,7 +446,6 @@ def _bucket_config_for_gep(array_sizes: list) -> dict:
     bound = min(s for s in array_sizes if s > 0)
 
     if bound <= 64:
-        # Values 0..bound individually, ≥bound+1 merged into OOB bucket.
         return {
             "scheme": "raw_capped",
             "thresholds": [bound],
@@ -400,19 +469,20 @@ def _bucket_config_for_gep(array_sizes: list) -> dict:
 
 def compute_absolute_offsets(main_func: str, layout: list) -> dict[str, tuple[int, int, str]]:
     """
-    Returns {field_name: (absolute_byte_offset, byte_size, llvm_type)} where
-    absolute_byte_offset is relative to the buffer returned by prism_get_state().
+    Returns {field_key: (absolute_byte_offset, byte_size, llvm_type)}.
 
-    If main_func is a nested struct inside the last layout entry (e.g. PumpController
-    inside PLC_PRG), the base offset of the nested struct is added.
+    For array fields, emits both the base name and per-element keys:
+      "Buffer"    →  (base_offset, total_size, "[8 x i16]")
+      "Buffer[0]" →  (base_offset+0,  2, "i16")
+      "Buffer[1]" →  (base_offset+2,  2, "i16")
+      ...
+    If main_func is a nested struct inside another layout entry the base
+    offset of the outer struct is added.
     """
-    # Find the layout entry for the main function
     main_layout = next((l for l in layout if l["struct_name"] == main_func), None)
     if not main_layout:
         return {}
 
-    # Find the base offset: does another layout entry contain a field whose
-    # llvm_type references the main function struct?
     base_offset = 0
     for struct in layout:
         if struct["struct_name"] == main_func:
@@ -429,7 +499,20 @@ def compute_absolute_offsets(main_func: str, layout: list) -> dict[str, tuple[in
         if not name or name == "__vtable":
             continue
         abs_offset = base_offset + field["byte_offset"]
-        result[name] = (abs_offset, field["byte_size"], field["llvm_type"])
+        size = field["byte_size"]
+        ltype = field["llvm_type"]
+
+        # Scalar or struct-typed field
+        result[name] = (abs_offset, size, ltype)
+
+        # Array field: also emit per-element entries
+        arr_m = re.match(r'\[(\d+)\s+x\s+(\w+)\]', ltype)
+        if arr_m:
+            arr_len = int(arr_m.group(1))
+            elem_type = arr_m.group(2)
+            elem_size = size // arr_len if arr_len else size
+            for i in range(arr_len):
+                result[f"{name}[{i}]"] = (abs_offset + i * elem_size, elem_size, elem_type)
 
     return result
 
@@ -442,50 +525,57 @@ def analyse(ddg: dict, layout: list) -> dict:
     G = build_graph(ddg)
     main_func = find_main_func(G)
 
-    stored   = get_stored_fields(G, main_func)
-    comps    = get_comparisons_by_field(G, main_func)
+    stored     = get_stored_fields(G, main_func)
+    comps      = get_comparisons_by_field(G, main_func)
     gep_fields = get_gep_sink_fields(G, main_func)
-    offsets  = compute_absolute_offsets(main_func, layout)
+    offsets    = compute_absolute_offsets(main_func, layout)
 
-    # Candidate fields: must be in the main function's struct
+    # Candidate fields: must have a known offset in the main struct
     known_fields = set(offsets.keys())
 
-    # Determine which fields are inputs (never stored within the function).
-    # A field stored within the function is a state variable.
-    input_fields = known_fields - stored
+    # A field key is an input if neither its key nor its base name was stored.
+    def is_input(fkey: str) -> bool:
+        base = re.sub(r'\[\d+\]$', '', fkey)
+        return fkey not in stored and base not in stored
 
     selected = []
     excluded = []
 
-    # Union of both arms — then filter
-    candidates = (set(comps.keys()) | set(gep_fields.keys())) & known_fields
+    # Union of both arms — restricted to known struct fields
+    # gep_fields uses base names, so map them to known_fields that share that base
+    gep_keys: set[str] = set()
+    for gf in gep_fields:
+        if gf in known_fields:
+            gep_keys.add(gf)
+        # Also include specific array element keys if the base is a GEP sink
+        for k in known_fields:
+            if re.sub(r'\[\d+\]$', '', k) == gf:
+                gep_keys.add(k)
+
+    candidates = (set(comps.keys()) | gep_keys) & known_fields
 
     for fname in sorted(candidates):
-        # Skip inputs (set externally by the harness, not state)
-        if fname in input_fields:
+        if is_input(fname):
             excluded.append((fname, "input field"))
             continue
 
-        # Skip __vtable / compiler internals
         if fname.startswith("__"):
             excluded.append((fname, "compiler internal"))
             continue
 
         field_comps = comps.get(fname, [])
-        field_geps  = gep_fields.get(fname, [])
+        base_name   = re.sub(r'\[\d+\]$', '', fname)
+        field_geps  = gep_fields.get(base_name, [])
 
-        # Determine selection arm(s)
         is_switch = all(p == "eq" for p, _ in field_comps) and len(field_comps) >= 3
         is_icmp   = bool(field_comps) and not is_switch
         is_danger = bool(field_geps)
 
-        # Loop variable heuristic: has both upper and lower bound comparisons
         if is_icmp and is_loop_variable(fname, field_comps):
             excluded.append((fname, "loop variable (symmetric bounds)"))
             continue
 
-        # Pure output: Status is a copy of Mode, has no comparisons, not a GEP sink
-        if not field_comps and not field_geps:
+        if not field_comps and not is_danger:
             excluded.append((fname, "no comparison and not a GEP sink"))
             continue
 
@@ -494,18 +584,24 @@ def analyse(ddg: dict, layout: list) -> dict:
             case_values = [t for _, t in field_comps]
             bucket = _bucket_config_for_switch(case_values)
             arm = "switch"
+        elif is_icmp and is_danger:
+            # Both arms apply: pick the scheme with more buckets (better gradient).
+            icmp_bucket = _bucket_config_for_icmp(field_comps)
+            gep_bucket  = _bucket_config_for_gep(field_geps)
+            if gep_bucket["bucket_count"] > icmp_bucket["bucket_count"]:
+                bucket = gep_bucket
+                arm    = "icmp+gep_sink(gep_scheme)"
+            else:
+                bucket = icmp_bucket
+                arm    = "icmp+gep_sink"
         elif is_icmp:
             bucket = _bucket_config_for_icmp(field_comps)
             arm = "icmp"
-            if is_danger:
-                arm = "icmp+gep_sink"
         else:
             bucket = _bucket_config_for_gep(field_geps)
             arm = "gep_sink"
 
         abs_offset, byte_size, llvm_type = offsets.get(fname, (0, 0, "?"))
-        # Switch discriminants describe current mode — track final value, not max.
-        # Accumulators with reset stores need high_watermark to capture peak progress.
         hwm = (not is_switch) and (has_reset_stores(fname, G, main_func) or is_danger)
 
         selected.append({
@@ -522,14 +618,12 @@ def analyse(ddg: dict, layout: list) -> dict:
             "high_watermark": hwm,
             "note": bucket["note"],
         })
-        excluded  # keep going
 
     # Total macro-state count (product of all bucket counts)
     total = 1
     for f in selected:
         total *= f["bucket_count"]
 
-    # Recommend a shmem size: next power of 2 above total * 2
     shmem = 256
     while shmem < total * 2:
         shmem *= 2
@@ -556,18 +650,23 @@ def print_summary(result: dict):
     print(f"{tag} Total macro-states : {result['total_macro_states']}")
     print(f"{tag} Shmem size hint    : {result['recommended_shmem_size']} bytes")
     print()
-    print(f"{tag} Selected fields ({len(result['fields'])}):")
-    for f in result["fields"]:
-        hwm_tag = " [hwm]" if f["high_watermark"] else ""
-        print(f"{tag}   {f['name']:18s} arm={f['selection_arm']:14s} "
-              f"scheme={f['bucket_scheme']:15s} buckets={f['bucket_count']:3d} "
-              f"offset={f['absolute_byte_offset']:3d}{hwm_tag}")
-        print(f"{tag}     {f['note']}")
+    if result["fields"]:
+        print(f"{tag} Selected fields ({len(result['fields'])}):")
+        for f in result["fields"]:
+            hwm_tag = " [hwm]" if f["high_watermark"] else ""
+            print(f"{tag}   {f['name']:20s} arm={f['selection_arm']:22s} "
+                  f"scheme={f['bucket_scheme']:15s} buckets={f['bucket_count']:3d} "
+                  f"offset={f['absolute_byte_offset']:3d}{hwm_tag}")
+            print(f"{tag}     {f['note']}")
+    else:
+        print(f"{tag} No state fields selected.")
+        print(f"{tag} This program has no multi-cycle accumulation state visible")
+        print(f"{tag} in the DDG — the bug may be reachable in a single scan cycle.")
     if result["_excluded"]:
         print()
         print(f"{tag} Excluded fields ({len(result['_excluded'])}):")
         for fname, reason in result["_excluded"]:
-            print(f"{tag}   {fname:18s} -- {reason}")
+            print(f"{tag}   {fname:20s} -- {reason}")
 
 
 # ---------------------------------------------------------------------------
@@ -588,7 +687,6 @@ def main():
     print_summary(result)
 
     if args.json:
-        # Strip the internal _excluded key before writing
         out = {k: v for k, v in result.items() if not k.startswith("_")}
         Path(args.json).write_text(json.dumps(out, indent=2))
         print(f"\n[state_hash] Wrote {args.json}")
