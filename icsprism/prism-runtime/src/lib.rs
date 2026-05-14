@@ -642,6 +642,67 @@ pub fn execute_testcase(config: &PrismFuzzConfig, data: &[u8], frame_size: usize
     execute_testcase_inner(config, data, frame_size, None)
 }
 
+/// Run a testcase and call `per_cycle` with the full struct snapshot after every cycle.
+///
+/// This is the primary integration point for state-hash feedback: the caller accumulates
+/// high-watermarks or other statistics over the per-cycle snapshots, then uses them to
+/// write a secondary coverage signal after execution finishes.
+///
+/// Returns false if the testcase data was too short to execute.
+pub fn execute_testcase_with_state_snapshots<F>(
+    config: &PrismFuzzConfig,
+    data: &[u8],
+    frame_size: usize,
+    per_cycle: &mut F,
+) -> bool
+where
+    F: FnMut(&[u8]),
+{
+    let Some(instance) = Instance::new() else {
+        return false;
+    };
+
+    if config.execution.per_testcase_reset {
+        unsafe { prism_reset(instance.0) };
+    }
+
+    let struct_size = unsafe { prism_struct_size() };
+    let mut snap = vec![0u8; struct_size];
+
+    match config.execution.mode {
+        ExecutionMode::SingleCycle => {
+            if data.len() < frame_size {
+                return false;
+            }
+            unsafe { prism_run(instance.0, data.as_ptr(), frame_size) };
+            unsafe { prism_get_state(instance.0, snap.as_mut_ptr()) };
+            per_cycle(&snap);
+        }
+        ExecutionMode::ScanSequence => {
+            let cycles = effective_cycles(config);
+            let needed = frame_size.saturating_mul(cycles);
+            if data.len() < needed {
+                return false;
+            }
+            let warmup = config
+                .execution
+                .warmup_cycles
+                .min(config.execution.max_cycles);
+            for _ in 0..warmup {
+                unsafe { prism_step(instance.0) };
+            }
+            for cycle in 0..cycles {
+                let start = cycle * frame_size;
+                let end = start + frame_size;
+                unsafe { prism_run(instance.0, data[start..end].as_ptr(), frame_size) };
+                unsafe { prism_get_state(instance.0, snap.as_mut_ptr()) };
+                per_cycle(&snap);
+            }
+        }
+    }
+    true
+}
+
 pub fn execute_testcase_with_heartbeat(
     config: &PrismFuzzConfig,
     data: &[u8],
