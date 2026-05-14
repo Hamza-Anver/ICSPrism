@@ -1,0 +1,12 @@
+[package]
+name = "prism-ddg-state"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libafl = { workspace = true }
+libafl_bolts = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+prism-runtime = { path = "../prism-runtime" }
