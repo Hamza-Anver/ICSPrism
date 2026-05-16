@@ -313,6 +313,7 @@ fn compute_bucket(field: &StateHashField, value: i32) -> usize {
 enum FieldRole {
     Inhibitor, // must stay 0 for accumulation to proceed (e.g. CmdReset)
     Activator, // pulse to trigger state transitions (e.g. CmdArm, CmdStart)
+    Driver,    // directly drives an accumulator in the chain (e.g. Pressure, Temp)
     Other,
 }
 
@@ -1135,6 +1136,8 @@ fn main() {
                         FieldRole::Inhibitor
                     } else if g.roles.iter().any(|r| r == "activator") {
                         FieldRole::Activator
+                    } else if g.roles.iter().any(|r| r == "driver") {
+                        FieldRole::Driver
                     } else {
                         FieldRole::Other
                     };
@@ -1177,7 +1180,8 @@ fn main() {
         let role_tag = match f.role {
             FieldRole::Inhibitor => " [inhibitor]",
             FieldRole::Activator => " [activator]",
-            FieldRole::Other => "",
+            FieldRole::Driver    => " [driver]",
+            FieldRole::Other     => "",
         };
         println!(
             "[prism-ddg-state]   {:20} off={:>2} size={:>2} score={:.3}{}",
