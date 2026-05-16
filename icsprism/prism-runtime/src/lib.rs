@@ -118,21 +118,37 @@ pub struct HarnessDimensions {
 }
 
 unsafe extern "C" {
+    // Lifecycle
     fn prism_alloc() -> *mut u8;
     fn prism_reset(instance: *mut u8);
     fn prism_free(instance: *mut u8);
+
+    // Execution
     fn prism_run(instance: *mut u8, data: *const u8, len: usize);
     fn prism_step(instance: *mut u8);
+
+    // Whole-struct state access
     fn prism_get_state(instance: *const u8, out: *mut u8);
+    fn prism_set_state(instance: *mut u8, state: *const u8, len: usize);
+
+    // Sizes
     fn prism_state_size() -> usize;
     fn prism_input_size() -> usize;
     fn prism_struct_size() -> usize;
+
+    // Program metadata
     fn prism_program_name() -> *const c_char;
+
+    // Field metadata
     fn prism_field_count() -> u32;
     fn prism_field_name(idx: u32) -> *const c_char;
+    fn prism_field_offset(idx: u32) -> usize;
     fn prism_field_size(idx: u32) -> usize;
     fn prism_field_is_input(idx: u32) -> i32;
+
+    // Per-field data access
     fn prism_get_field(instance: *const u8, idx: u32, out: *mut u8) -> usize;
+    fn prism_set_field(instance: *mut u8, idx: u32, data: *const u8, len: usize) -> i32;
 }
 
 pub fn harness_dimensions() -> HarnessDimensions {
@@ -141,6 +157,34 @@ pub fn harness_dimensions() -> HarnessDimensions {
         state_size: unsafe { prism_state_size() },
         struct_size: unsafe { prism_struct_size() },
     }
+}
+
+/// Byte offset of field `idx` within the PLC struct.
+pub fn field_offset(idx: u32) -> usize {
+    unsafe { prism_field_offset(idx) }
+}
+
+/// Name of field `idx`, or `None` if the index is out of range.
+pub fn field_name(idx: u32) -> Option<String> {
+    let ptr = unsafe { prism_field_name(idx) };
+    if ptr.is_null() {
+        return None;
+    }
+    Some(unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
+}
+
+/// Number of fields in the PLC struct.
+pub fn field_count() -> u32 {
+    unsafe { prism_field_count() }
+}
+
+/// Program name as declared in the ST source.
+pub fn program_name() -> Option<String> {
+    let ptr = unsafe { prism_program_name() };
+    if ptr.is_null() {
+        return None;
+    }
+    Some(unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
 }
 
 pub fn print_startup_diagnostics(
@@ -163,12 +207,67 @@ pub fn print_startup_diagnostics(
     }
 }
 
-struct Instance(*mut u8);
+/// RAII wrapper around a heap-allocated PLC instance.
+///
+/// All harness calls that operate on an instance go through this type so that
+/// `prism_free` is always called on drop and raw pointers never escape.
+pub struct Instance(*mut u8);
+
+// The pointer is owned exclusively by this handle and is never aliased across
+// threads in normal usage.
+unsafe impl Send for Instance {}
 
 impl Instance {
-    fn new() -> Option<Self> {
+    /// Allocate a new zeroed PLC instance.  Returns `None` if allocation fails.
+    pub fn new() -> Option<Self> {
         let ptr = unsafe { prism_alloc() };
         if ptr.is_null() { None } else { Some(Self(ptr)) }
+    }
+
+    /// Zero the entire struct (equivalent to calloc — sets all fields to 0).
+    pub fn reset(&mut self) {
+        unsafe { prism_reset(self.0) };
+    }
+
+    /// Write `frame` into the input fields then run one scan cycle.
+    pub fn run(&mut self, frame: &[u8]) {
+        unsafe { prism_run(self.0, frame.as_ptr(), frame.len()) };
+    }
+
+    /// Run one scan cycle without touching input fields (warmup / free-run).
+    pub fn step(&mut self) {
+        unsafe { prism_step(self.0) };
+    }
+
+    /// Copy the entire struct into `out`.  `out` must be at least `struct_size()` bytes.
+    pub fn get_state(&self, out: &mut [u8]) {
+        unsafe { prism_get_state(self.0, out.as_mut_ptr()) };
+    }
+
+    /// Restore the struct from `state`, preserving the vtable pointer.
+    /// `state` should be a slice previously obtained from `get_state`.
+    pub fn set_state(&mut self, state: &[u8]) {
+        unsafe { prism_set_state(self.0, state.as_ptr(), state.len()) };
+    }
+
+    /// Read field `idx` into `out`.  Returns the number of bytes copied (0 on error).
+    pub fn get_field(&self, idx: u32, out: &mut [u8]) -> usize {
+        unsafe { prism_get_field(self.0, idx, out.as_mut_ptr()) }
+    }
+
+    /// Write `data` into field `idx`.  Returns `true` on success.
+    pub fn set_field(&mut self, idx: u32, data: &[u8]) -> bool {
+        unsafe { prism_set_field(self.0, idx, data.as_ptr(), data.len()) != 0 }
+    }
+
+    /// Raw const pointer — only needed when passing to LibAFL harness closures.
+    pub fn as_ptr(&self) -> *const u8 {
+        self.0
+    }
+
+    /// Raw mutable pointer — only needed for FFI interop.
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.0
     }
 }
 
@@ -699,6 +798,47 @@ where
                 per_cycle(&snap);
             }
         }
+    }
+    true
+}
+
+/// Run `new_frames` starting from a saved PLC struct snapshot instead of from
+/// the initial zeroed state.  Calls `per_cycle` with the struct snapshot after
+/// every cycle, exactly like `execute_testcase_with_state_snapshots`.
+///
+/// This is the primary primitive for Go-Explore style fuzzing: the caller
+/// restores a checkpoint reached by a previous testcase and then explores new
+/// input sequences from that point, avoiding a full replay from INIT.
+///
+/// `snapshot` must be a byte slice previously obtained from `Instance::get_state`
+/// (i.e. `prism_struct_size()` bytes).  `new_frames` is a packed sequence of
+/// input frames, each `frame_size` bytes, applied after the snapshot is restored.
+pub fn execute_testcase_from_checkpoint<F>(
+    snapshot: &[u8],
+    new_frames: &[u8],
+    frame_size: usize,
+    per_cycle: &mut F,
+) -> bool
+where
+    F: FnMut(&[u8]),
+{
+    if frame_size == 0 || new_frames.len() < frame_size {
+        return false;
+    }
+    let Some(mut instance) = Instance::new() else {
+        return false;
+    };
+    instance.set_state(snapshot);
+
+    let cycles = new_frames.len() / frame_size;
+    let struct_size = unsafe { prism_struct_size() };
+    let mut snap = vec![0u8; struct_size];
+
+    for cycle in 0..cycles {
+        let start = cycle * frame_size;
+        instance.run(&new_frames[start..start + frame_size]);
+        instance.get_state(&mut snap);
+        per_cycle(&snap);
     }
     true
 }

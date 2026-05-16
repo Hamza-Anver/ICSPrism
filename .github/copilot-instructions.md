@@ -1,145 +1,38 @@
 # Copilot instructions for ICSPrism
 
-## Scope and repository layout
-- Primary active code is in `icsprism/` (workspace with `ir-analysis`, `prism-runtime`, `prism-cov`, `prism-ddg`, `prism-ddg-input`, `prism-sanity`).
-- `rusty/` is a Git submodule (`.gitmodules`) and is treated as an upstream dependency used to produce `./rusty/target/debug/plc`, which the local scripts call.
+## What matters here
+- Treat [icsprism/](icsprism) as the active workspace. The code you usually want is in `ir-analysis`, `prism-runtime`, `prism-cov`, `prism-ddg`, `prism-ddg-input`, and `prism-sanity`.
+- Treat [rusty/](rusty) as an upstream submodule dependency unless the task explicitly concerns the compiler itself.
+- Prefer linking to [README.md](README.md) for broad project context instead of restating it here.
 
-## Build, test, and lint commands
-Run commands from repository root unless noted.
+## Build and validation
+Run commands from the repository root unless the script says otherwise.
 
 | Task | Command |
 | --- | --- |
-| Build all ICSPrism crates | `cargo build --manifest-path icsprism/Cargo.toml` |
+| Build the ICSPrism workspace | `cargo build --manifest-path icsprism/Cargo.toml` |
 | Build one crate | `cargo build --manifest-path icsprism/Cargo.toml -p ir-analysis` |
 | Build one binary | `cargo build --manifest-path icsprism/Cargo.toml --bin prism-analyze` |
-| Run all tests in ICSPrism workspace | `cargo test --manifest-path icsprism/Cargo.toml --workspace` |
-| Run a single test | `cargo test --manifest-path icsprism/Cargo.toml -p ir-analysis <test_name> -- --exact` |
+| Test the workspace | `cargo test --manifest-path icsprism/Cargo.toml --workspace` |
 | Lint | `cargo clippy --manifest-path icsprism/Cargo.toml --workspace --all-targets` |
 | Format | `cargo fmt --all --manifest-path icsprism/Cargo.toml` |
 
-Existing helper scripts for end-to-end compilation/fuzzing prep:
+- For RuSTy builds, set `LLVM_SYS_211_PREFIX=$(llvm-config-21 --prefix)` first; the README’s build note is the source of truth.
+- Prefer the narrowest command that validates the touched slice. Use the workspace test/build commands above before broader checks.
 
-- `scripts/compile_ll_bc.sh <file.st> <output_dir>`: ST -> `.bc` and `.ll`
-- `scripts/compile_o_so.sh <file.st> <output_dir>`: ST -> `.bc`/`.ll` -> instrumented `.o` -> `.so`
-- `scripts/compile_all.sh <file.st> <output_dir>`: adds `prism-analyze` output (`*_layout.json`, `*_ddg.json`, `*_ddg.dot`)
-- `scripts/stc.sh <file.st> <output_dir> [program_name]`: adds harness generation and links shared library with harness
-- `scripts/stc_prism_cov_fuzz <st_file_or_name> [config_file] [-- <fuzzer args>]`: compiles ST, runs coverage-guided fuzzer (`prism-cov`)
-- `scripts/stc_prism_ddg_fuzz <st_file_or_name> [config_file] [-- <fuzzer args>]`: compiles ST, generates DDG weights via Python analysis, runs DDG-biased fuzzer (`prism-ddg`)
-- `scripts/stc_prism_ddg_input_fuzz <st_file_or_name> [config_file] [-- <fuzzer args>]`: compiles ST, generates DDG weights, runs input-restricted DDG fuzzer (`prism-ddg-input`)
+## Workflow conventions
+- Use the helper scripts in [scripts/](scripts) for end-to-end ST compilation and fuzzing flows: `compile_ll_bc.sh`, `compile_o_so.sh`, `compile_all.sh`, `stc.sh`, `stc_prism_cov_fuzz`, `stc_prism_ddg_fuzz`, and `stc_prism_ddg_input_fuzz`.
+- `prism-runtime` owns shared execution and config loading for the fuzzers. Default execution mode is `SingleCycle`; switch to `scan_sequence` in config when a benchmark needs state to persist across cycles.
+- Multi-cycle accumulator programs such as `pump_controller` are the main place this matters. If a fuzzing run stalls at baseline coverage, check the execution mode before changing analysis code.
+- `prism-ddg-input` mutates compact input bytes, not the full PLC frame; keep field offset and layout JSON handling consistent with that model.
 
-Runtime/config layer:
+## Artifact and analysis conventions
+- The common outputs are `<prefix>_layout.json`, `<prefix>_ddg.json`, `<prefix>_weights.json`, `<prefix>_harness.c`, and `lib<prefix>.so`.
+- Layout JSON is an array; fuzzers use the last entry as the top-level program struct.
+- DDG analysis lives in [tools/probe_ddg_adv.py](tools/probe_ddg_adv.py) and [tools/ddg_to_dot.py](tools/ddg_to_dot.py). Link to those tools instead of duplicating their logic here.
+- `probe_ddg_adv.py` is the place to reason about control-flow guards, source-level field roles, and byte-weight generation.
 
-- `icsprism/prism-runtime`: shared execution/config crate used by `prism-cov`, `prism-ddg`, and `prism-ddg-input`
-- Supports `ExecutionMode::{SingleCycle, ScanSequence}` and shared required-input sizing
-- Loads config from `--config <path>` or local `prism-fuzz.toml`, then falls back to defaults
-- **Default execution mode is `SingleCycle`** — for multi-cycle accumulator programs, create a config file with `mode = "scan_sequence"`
-
-DDG analysis (Python tools in `tools/`):
-
-- `tools/probe_ddg_adv.py <target>_ddg.json <target>_layout.json [--json out.json]`: advanced DDG analyser
-  - Traces control-flow guards to prism_bug_abort_if targets (handles constant-arg aborts with no data-flow predecessors)
-  - Resolves ICmp comparisons to source-level field names via SSA backtracking (ZExt, SExt, Trunc, GEP chains)
-  - Reconstructs multi-cycle accumulation chains (e.g., Pressure > 70 → PressureScore++ → Buffer++ → ABORT)
-  - Classifies input field roles (driver, inhibitor, neutral, fault_gate) based on guard semantics
-  - Outputs byte-level weights and machine-readable JSON for fuzzer guidance
-- `tools/ddg_to_dot.py <target>_ddg.json [--out <output.dot>]`: converts DDG JSON to Graphviz DOT format
-
-## High-level architecture
-ICSPrism is an LLVM-IR-driven fuzzing pipeline around Structured Text programs.
-
-1. ST compilation stage: scripts call `./rusty/target/debug/plc` to generate LLVM IR (`.ll`) and bitcode (`.bc`) from `.st`.
-2. IR analysis stage (`icsprism/ir-analysis`):
-   - `prism-analyze` parses IR with inkwell and emits:
-     - struct layout JSON (`*_layout.json`)
-     - DDG graph JSON (`*_ddg.json`)
-     - DDG DOT graph (`*_ddg.dot`)
-   - `prism-harness` consumes layout JSON and emits C harness code exposing a stable `prism_*` ABI.
-3. Harness/shared-library stage: scripts compile IR + generated C harness into `lib<name>.so`.
-4. Fuzzing stage:
-   - `prism-cov`: coverage-guided fuzzer; now uses `prism-runtime` for shared harness execution and config loading.
-   - `prism-ddg`: DDG-biased fuzzer; now uses `prism-runtime` for shared harness execution and config loading.
-   - `prism-sanity`: ABI/scan-cycle sanity checker against generated harness libraries.
-   - All three dynamically link against the generated `.so` via `PRISM_LIB_DIR` and `PRISM_LIB_NAME` (from each crate’s `build.rs`).
-
-## Key codebase conventions
-
-**JSON artifact schema:**
-- Layout JSON is a top-level array of program layouts (may contain multiple struct types for FB-chained programs); fuzzers use the **last entry** as the top-level program struct
-- DDG JSON contains `nodes` (IR instructions with metadata) and `edges` (data/control dependencies)
-- Weights JSON (generated by `probe_ddg_adv.py`) contains:
-  - `main_function`: struct name of top-level program
-  - `frame_size`: byte size of input frame
-  - `input_fields`: array of fuzzable fields with roles (driver/inhibitor/neutral/fault_gate), models, criticality, and byte weights
-  - `accumulation_chain`: control-flow chains leading to abort (reconstructed from DDG)
-  - `byte_weights`: per-byte mutation weight for guidance
-
-**Field filtering in prism-ddg-input:**
-- Fuzzable input fields (selected for mutation) are those marked `critical=true` OR with non-neutral roles
-- Excluded fields:
-  - Internal/vtable fields: `__vtable`, internal state fields not in PLC input interface
-  - Nested struct-typed fields (`llvm_type` starting with `%`)
-  - Pointers (`ptr`) treated as state/internal
-
-**Execution model:**
-- **Default mode**: `SingleCycle` — one program invocation per testcase; suitable for combinational logic
-- **Multi-cycle mode**: `ScanSequence` — input expanded per cycle (e.g., `[cycle0_inputs, cycle1_inputs, ...]`); program state persists across cycles; needed for accumulator programs (PLC-style state machines)
-- **Important**: Accumulator programs (like pump_controller with PressureScore/Buffer) require `scan_sequence` mode in config file, else fuzzer cannot trigger multi-cycle guard chains
-
-**Output naming convention:**
-- `<prefix>_layout.json`, `<prefix>_ddg.json`
-- `<prefix>_weights.json` (generated by probe_ddg_adv.py)
-- `<prefix>_harness.c` (generated harness source)
-- `lib<prefix>.so` (compiled shared library)
-
-**Coverage and dynamic linking:**
-- All fuzzers (`prism-cov`, `prism-ddg`, `prism-ddg-input`) implement SanitizerCoverage hooks (`__sanitizer_cov_trace_pc_guard*`) and share fixed coverage map size (`MAP_SIZE = 65536`)
-- `build.rs` in each fuzzer crate requires:
-  - `PRISM_LIB_DIR` = directory containing `lib<name>.so`
-  - `PRISM_LIB_NAME` = library basename without `lib` prefix / `.so` suffix
-
-**prism-ddg-input specifics:**
-- Mutates only compact input bytes (not full struct including internal state)
-- Expands compact input to full frame using field offset mapping from weights JSON
-- Applies byte-level weights for targeted mutation (high weight = higher mutation frequency)
-- Uses CompactByteMutator (weighted random byte selection) combined with libafl havoc mutations
-
-## Troubleshooting
-
-### prism-ddg-input not discovering objectives in pump_controller
-
-**Symptoms:**
-- Fuzzer runs but only finds baseline coverage (edges: 5-10/65536)
-- State variables (PressureScore, Buffer) never increment
-- No crash objectives discovered
-
-**Root cause:**
-pump_controller requires multi-cycle execution to trigger the abort condition. The fuzzer runs by default in `SingleCycle` mode, which executes the program once per testcase. Reaching the abort requires:
-1. **Cycle 0**: Set Pressure > 70 to trigger PressureScore increment condition
-2. **Cycle 1**: Re-run with state persisted → PressureScore increments
-3. **Cycle 2**: Re-run again → PressureScore >= 4 triggers Buffer increment  
-4. **Cycle 3**: Re-run again → Buffer > 1 triggers abort
-
-**Solution:**
-Create a config file with `scan_sequence` mode:
-```toml
-[execution]
-mode = "scan_sequence"
-cycles = 4
-per_testcase_reset = true
-timeout_ms = 5000
-```
-
-Then run:
-```bash
-export LLVM_SYS_211_PREFIX=$(llvm-config-21 --prefix)
-scripts/stc_prism_ddg_input_fuzz benchmarks/pump_controller.st pump_controller.toml
-```
-
-**Why this works:**
-In `ScanSequence` mode, the fuzzer expands each input to 4 cycles: `[cycle0_input, cycle1_input, cycle2_input, cycle3_input]`. The harness calls `prism_run()` multiple times with state persistence, allowing the accumulation chain to execute across all 4 cycles within a single testcase.
-
-**Verification:**
-Watch for state heartbeat output showing:
-- PressureScore incrementing (no longer always 0)
-- Buffer values increasing (no longer all zeros)
-- Eventually: crash objective discovered when Buffer > 1 condition triggers
+## Editing rules
+- Keep changes focused on the active crate or script path; avoid rewriting generated artifacts under `target/`.
+- Preserve existing file and output naming conventions so the scripts and build scripts continue to line up.
+- If a benchmark or fuzzer behavior looks off, inspect the local crate or script first before broadening the search.
