@@ -1,0 +1,6 @@
+[execution]
+mode = "scan_sequence"
+cycles = 500
+warmup_cycles = 0
+per_testcase_reset = true
+timeout_ms = 10000

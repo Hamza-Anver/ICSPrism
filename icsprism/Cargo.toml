@@ -5,10 +5,10 @@ members = [
     "prism-runtime",
     "prism-cov",
     "prism-ddg",
-    "prism-ddg-input",
     "prism-sanity",
     "prism-ddg-not-dumb",
     "prism-ddg-state",
+    "prism-go-explore",
 ]
 
 [workspace.dependencies]
