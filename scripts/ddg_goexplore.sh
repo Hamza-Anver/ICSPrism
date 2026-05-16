@@ -75,19 +75,22 @@ if [[ ! -f "$STATE_HASH_JSON" ]]; then
     exit 1
 fi
 
+# Auto-generate zone constraints if not already present.
+if [[ ! -f "$ZONE_CONSTRAINTS_JSON" ]]; then
+    echo "[goexplore] Zone constraints not found — auto-generating from weights + layout..."
+    python3 "$ROOT/tools/ddg_analysis/probe_goexplore_zones.py" \
+        "$WEIGHTS_JSON" \
+        "$TARGET/${NAME}_layout.json" \
+        --output "$ZONE_CONSTRAINTS_JSON"
+fi
+echo "[goexplore] Zone constraints: $ZONE_CONSTRAINTS_JSON"
+
 CMD=(cargo run --bin prism-go-explore --manifest-path "$ROOT/icsprism/Cargo.toml" --
      --ddg     "$TARGET/${NAME}_ddg.json"
      --layout  "$TARGET/${NAME}_layout.json"
      --weights-json "$WEIGHTS_JSON"
-     --state-hash   "$STATE_HASH_JSON")
-
-# Add zone constraints if the file exists for this program.
-if [[ -f "$ZONE_CONSTRAINTS_JSON" ]]; then
-    echo "[goexplore] Zone constraints: $ZONE_CONSTRAINTS_JSON"
-    CMD+=(--zone-constraints "$ZONE_CONSTRAINTS_JSON")
-else
-    echo "[goexplore] No zone constraints found at $ZONE_CONSTRAINTS_JSON (checkpoint bursts disabled)"
-fi
+     --state-hash   "$STATE_HASH_JSON"
+     --zone-constraints "$ZONE_CONSTRAINTS_JSON")
 
 if [[ -n "$CONFIG_PATH" ]]; then
     CMD+=(--config "$CONFIG_PATH")

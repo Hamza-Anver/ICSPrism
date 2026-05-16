@@ -135,14 +135,33 @@ struct Args {
     #[arg(long, default_value_t = 500)]
     burst_size: usize,
 
-    /// How many burst attempts to run from the best checkpoint each cycle.
+    /// How many burst attempts to run per cycle.
     #[arg(long, default_value_t = 50)]
     burst_repeats: usize,
+
+    /// How to select which checkpoint(s) to burst from each cycle.
+    /// `best`: all burst_repeats from the highest bucket (default).
+    /// `round-robin`: distribute burst_repeats evenly across all filled checkpoints.
+    #[arg(long, value_enum, default_value_t = CheckpointStrategy::Best)]
+    checkpoint_strategy: CheckpointStrategy,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckpointStrategy {
+    Best,
+    RoundRobin,
 }
 
 // ---------------------------------------------------------------------------
 // Zone constraint types
 // ---------------------------------------------------------------------------
+
+/// Per-field [lo, hi] range used in burst frame generation.
+#[derive(Debug, Clone, Deserialize)]
+struct FieldRange {
+    lo: i16,
+    hi: i16,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 struct ZoneConstraint {
@@ -152,32 +171,28 @@ struct ZoneConstraint {
     fillhead_lo: i32,
     #[allow(dead_code)]
     fillhead_hi: i32,
-    pvsum_lo: i16,
-    pvsum_hi: i16,
-    pipetemp_lo: i16,
-    pipetemp_hi: i16,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct FillAccumConstraints {
-    pump_rate_lo: i16,
-    pump_rate_hi: i16,
-    back_pressure_lo: i16,
-    back_pressure_hi: i16,
+    /// Generic per-field constraints: maps field name → [lo, hi] sampling range.
+    /// Only non-inhibitor fields need entries; missing fields fall back to
+    /// sampling from their target_values.
+    #[serde(default)]
+    field_constraints: std::collections::HashMap<String, FieldRange>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct ZoneConstraintsConfig {
     #[allow(dead_code)]
     discriminant_field: String,
-    /// Absolute byte offset of the FillHead field within the struct snapshot
-    /// (i.e. what prism_get_state returns). For pipeline_controller this is 58.
+    /// Absolute byte offset of the discriminant field within the struct snapshot.
     fillhead_byte_offset: usize,
     fillhead_byte_size: usize,
-    /// Ordered list of input field names that compose PVsum (first = primary driver).
-    pvsum_inputs: Vec<String>,
+    /// Inclusive upper bound for the discriminant — sets checkpoint table size.
+    #[serde(default = "default_max_fillhead")]
+    max_fillhead: u32,
     zones: Vec<ZoneConstraint>,
-    fill_accum_constraints: FillAccumConstraints,
+}
+
+fn default_max_fillhead() -> u32 {
+    255
 }
 
 // ---------------------------------------------------------------------------
@@ -1033,65 +1048,68 @@ fn write_i16_le(buf: &mut [u8], offset: usize, value: i16) {
     }
 }
 
-/// Generate `n_frames` packed input frames satisfying the given zone constraints.
+/// Generate `n_frames` packed input frames for a checkpoint burst.
 ///
-/// Each frame has driver fields set to values that advance FillHead for this zone,
-/// inhibitor fields zeroed, and unrecognised fields left at 0.
+/// For each input field per frame:
+///   - Inhibitors: zeroed (all `size` bytes, not just one).
+///   - In `field_constraints`: sampled uniformly from [lo, hi].
+///   - I16 with target values: sampled from target list (80%) or uniform (20%).
+///   - Bool: random 0/1.
+///   - Otherwise: left as 0.
+///
+/// `field_constraints` is the zone's generic map (field name → [lo, hi]).
+/// Passing an empty map is valid — it triggers pure target-value-guided generation,
+/// which is the correct fallback when no zone config is available.
 fn generate_zone_frames(
-    zone: &ZoneConstraint,
-    fill: &FillAccumConstraints,
-    pvsum_inputs: &[String],
+    field_constraints: &HashMap<String, FieldRange>,
     input_fields: &[InputField],
     frame_size: usize,
     n_frames: usize,
     rng: &mut impl Rand,
 ) -> Vec<u8> {
-    let by_name: HashMap<&str, &InputField> =
-        input_fields.iter().map(|f| (f.name.as_str(), f)).collect();
-
     let mut out = vec![0u8; frame_size * n_frames];
 
     for fi in 0..n_frames {
         let frame = &mut out[fi * frame_size..(fi + 1) * frame_size];
 
-        // PVsum → split into pvsum_inputs[0] (primary) and pvsum_inputs[1] (secondary).
-        // Primary clamped to [pump_rate_lo, pump_rate_hi]; secondary gets the remainder.
-        let pvsum = rand_i16_in(rng, zone.pvsum_lo, zone.pvsum_hi);
-        if pvsum_inputs.len() >= 2 {
-            let primary = (pvsum / 2).clamp(fill.pump_rate_lo, fill.pump_rate_hi);
-            let secondary = pvsum.saturating_sub(primary);
-            if let Some(f) = by_name.get(pvsum_inputs[0].as_str()) {
-                if f.size == 2 {
-                    write_i16_le(frame, f.offset, primary);
+        for field in input_fields {
+            if field.offset >= frame_size || field.size == 0 {
+                continue;
+            }
+            let end = (field.offset + field.size).min(frame_size);
+
+            if field.role == FieldRole::Inhibitor {
+                // Zero all bytes of the inhibitor (not just byte 0).
+                for b in &mut frame[field.offset..end] {
+                    *b = 0;
                 }
-            }
-            if let Some(f) = by_name.get(pvsum_inputs[1].as_str()) {
-                if f.size == 2 {
-                    write_i16_le(frame, f.offset, secondary);
+            } else if let Some(range) = field_constraints.get(&field.name) {
+                // Zone-specific constraint: sample from [lo, hi].
+                if field.size == 2 {
+                    write_i16_le(frame, field.offset, rand_i16_in(rng, range.lo, range.hi));
+                } else if field.size == 1 {
+                    let v = rand_i16_in(rng, range.lo.max(0), range.hi.max(0)) as u8;
+                    frame[field.offset] = v;
                 }
-            }
-        }
-
-        // PipeTemp within zone's temperature window.
-        let temp = rand_i16_in(rng, zone.pipetemp_lo, zone.pipetemp_hi);
-        if let Some(f) = by_name.get("PipeTemp") {
-            if f.size == 2 {
-                write_i16_le(frame, f.offset, temp);
-            }
-        }
-
-        // BackPressure within the fill accumulation range.
-        let bp = rand_i16_in(rng, fill.back_pressure_lo, fill.back_pressure_hi);
-        if let Some(f) = by_name.get("BackPressure") {
-            if f.size == 2 {
-                write_i16_le(frame, f.offset, bp);
-            }
-        }
-
-        // Inhibitor fields must stay 0 (frame is already zeroed, but be explicit).
-        for f in input_fields {
-            if f.role == FieldRole::Inhibitor && f.offset < frame_size {
-                frame[f.offset] = 0;
+            } else {
+                // No zone constraint: fall back to sampling from target_values.
+                match &field.model {
+                    FieldValueModel::I16 { targets } if !targets.is_empty() => {
+                        let use_target = (rng.next() % 100) < 80;
+                        let value: i16 = if use_target {
+                            targets[(rng.next() as usize) % targets.len()]
+                        } else {
+                            rng.next() as i16
+                        };
+                        if field.size == 2 {
+                            write_i16_le(frame, field.offset, value);
+                        }
+                    }
+                    FieldValueModel::Bool => {
+                        frame[field.offset] = (rng.next() & 1) as u8;
+                    }
+                    _ => {} // Raw / unknown: leave 0
+                }
             }
         }
     }
@@ -1123,49 +1141,43 @@ fn checkpoint_burst(
         return;
     }
 
-    // Generate frames: zone-aware if config present, random otherwise.
-    let frames = if let Some(zc) = zone_config {
-        // Use the current zone — its PVsum and PipeTemp windows match where FillHead
-        // is now. Targeting the next zone would push PipeTemp outside zone bounds,
-        // triggering decay that resets FillHead rather than advancing it.
-        let zone_id = (bucket / 8).min(zc.zones.len().saturating_sub(1));
-        let zone = &zc.zones[zone_id];
-        static BURST_COUNTER: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
-        let burst_id = BURST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x1337)
-            ^ (bucket as u64).wrapping_mul(0x9e3779b9)
-            ^ burst_id.wrapping_mul(0x517c_c1b7_2722_0a95);
-        let mut rng = StdRand::with_seed(seed);
-        generate_zone_frames(
-            zone,
-            &zc.fill_accum_constraints,
-            &zc.pvsum_inputs,
-            input_fields,
-            frame_size,
-            rollout_frames,
-            &mut rng,
-        )
+    // Unique seed per burst so consecutive bursts explore different inputs.
+    static BURST_COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let burst_id = BURST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x1337)
+        ^ (bucket as u64).wrapping_mul(0x9e3779b9)
+        ^ burst_id.wrapping_mul(0x517c_c1b7_2722_0a95);
+    let mut rng = StdRand::with_seed(seed);
+
+    // Resolve zone-specific field constraints: look up which zone the current
+    // bucket falls in, then use its field_constraints map.  If no zone config
+    // is present we pass an empty map, which causes generate_zone_frames to fall
+    // back to target_value sampling (DDG-guided, not pure random).
+    let empty_constraints: HashMap<String, FieldRange> = HashMap::new();
+    let field_constraints: &HashMap<String, FieldRange> = if let Some(zc) = zone_config {
+        // Find the zone whose [fillhead_lo, fillhead_hi) contains this bucket.
+        let zone = zc
+            .zones
+            .iter()
+            .find(|z| bucket as i32 >= z.fillhead_lo && (bucket as i32) < z.fillhead_hi)
+            .or_else(|| zc.zones.last())
+            .unwrap();
+        &zone.field_constraints
     } else {
-        // No zone config: generate random frames (graceful degradation).
-        static BURST_COUNTER_RAND: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
-        let burst_id = BURST_COUNTER_RAND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x1337)
-            ^ burst_id.wrapping_mul(0x517c_c1b7_2722_0a95);
-        let mut rng = StdRand::with_seed(seed);
-        let mut f = vec![0u8; frame_size * rollout_frames];
-        for b in &mut f {
-            *b = rng.next() as u8;
-        }
-        f
+        &empty_constraints
     };
+
+    let frames = generate_zone_frames(
+        field_constraints,
+        input_fields,
+        frame_size,
+        rollout_frames,
+        &mut rng,
+    );
 
     // Reset the checkpoint flag before forking so a stale value from the last
     // fuzz_one can't be mistaken for the burst child's result.
@@ -1209,7 +1221,8 @@ fn checkpoint_burst(
             unsafe {
                 if !CHECKPOINT_MAP_PTR.is_null() {
                     *CHECKPOINT_MAP_PTR = 1;
-                    *CHECKPOINT_MAP_PTR.add(1) = burst_fillhead_max.min(64) as u8;
+                    // Clamp to u8::MAX; parent validates against checkpoint_table.len().
+                    *CHECKPOINT_MAP_PTR.add(1) = burst_fillhead_max.min(u8::MAX as i32) as u8;
                     std::ptr::copy_nonoverlapping(
                         burst_best_snap.as_ptr(),
                         CHECKPOINT_MAP_PTR.add(CHECKPOINT_HDR),
@@ -1230,7 +1243,7 @@ fn checkpoint_burst(
     if unsafe { !CHECKPOINT_MAP_PTR.is_null() && *CHECKPOINT_MAP_PTR == 1 } {
         let burst_bucket = unsafe { *CHECKPOINT_MAP_PTR.add(1) } as usize;
         // Only record a genuine advance beyond the starting checkpoint.
-        if burst_bucket < 65 && burst_bucket > bucket && checkpoint_table[burst_bucket].is_none() {
+        if burst_bucket < checkpoint_table.len() && burst_bucket > bucket && checkpoint_table[burst_bucket].is_none() {
             let mut snap = vec![0u8; struct_size];
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -1546,7 +1559,7 @@ fn main() {
             unsafe {
                 if !CHECKPOINT_MAP_PTR.is_null() {
                     *CHECKPOINT_MAP_PTR = 1; // flag: new checkpoint available
-                    *CHECKPOINT_MAP_PTR.add(1) = fillhead_max.max(0).min(64) as u8;
+                    *CHECKPOINT_MAP_PTR.add(1) = fillhead_max.max(0).min(u8::MAX as i32) as u8;
                     let n = best_snap.len().min(struct_size);
                     std::ptr::copy_nonoverlapping(
                         best_snap.as_ptr(),
@@ -1604,13 +1617,19 @@ fn main() {
     // Custom fuzz loop: fuzz_one in bursts, then run checkpoint exploration.
     // -----------------------------------------------------------------------
 
-    // One entry per FillHead bucket (0..=64). Populated as the harness discovers
-    // new high-watermarks and signals them via checkpoint shmem.
-    let mut checkpoint_table: Vec<Option<Vec<u8>>> = vec![None; 65];
+    // Checkpoint table: one slot per FillHead value from 0 to max_fillhead.
+    // Size is derived from zone config's max_fillhead so it works for any program.
+    let max_fillhead: usize = zone_config
+        .as_ref()
+        .map(|zc| zc.max_fillhead as usize)
+        .unwrap_or(255);
+    let chk_table_len = max_fillhead + 1;
+    let mut checkpoint_table: Vec<Option<Vec<u8>>> = vec![None; chk_table_len];
 
     let burst_size = args.burst_size;
     let rollout_frames = args.rollout_frames;
     let burst_repeats = args.burst_repeats;
+    let checkpoint_strategy = args.checkpoint_strategy;
     let crashes_dir = args.crashes.clone();
     let zone_cfg = zone_config;
     let burst_fields = runtime_input_fields.clone();
@@ -1634,7 +1653,7 @@ fn main() {
             // Check if the child wrote a new checkpoint into shmem.
             if !chk_ptr.is_null() && unsafe { *chk_ptr } == 1 {
                 let bucket = unsafe { *chk_ptr.add(1) } as usize;
-                if bucket < 65 && checkpoint_table[bucket].is_none() {
+                if bucket < chk_table_len && checkpoint_table[bucket].is_none() {
                     let mut snap = vec![0u8; struct_size];
                     unsafe {
                         std::ptr::copy_nonoverlapping(
@@ -1682,31 +1701,49 @@ fn main() {
             );
         }
 
-        // Phase 2: run burst_repeats bursts from the best (highest FillHead) checkpoint.
-        let best_bucket = checkpoint_table
-            .iter()
-            .enumerate()
-            .rfind(|(_, s)| s.is_some())
-            .map(|(i, _)| i);
-
-        if let Some(bucket) = best_bucket {
-            // Clone the snapshot so we can also pass &mut checkpoint_table to the
-            // burst (which records any new checkpoints the burst discovers).
-            if let Some(snap) = checkpoint_table[bucket].clone() {
-                for _ in 0..burst_repeats {
-                    total_bursts += 1;
-                    checkpoint_burst(
-                        bucket,
-                        &snap,
-                        zone_cfg.as_ref(),
-                        &burst_fields,
-                        frame_size,
-                        rollout_frames,
-                        &crashes_dir,
-                        struct_size,
-                        fillhead_info,
-                        &mut checkpoint_table,
-                    );
+        // Phase 2: burst from checkpoints according to the chosen strategy.
+        match checkpoint_strategy {
+            CheckpointStrategy::Best => {
+                // Burst burst_repeats times from the single highest filled checkpoint.
+                let best_bucket = checkpoint_table
+                    .iter()
+                    .enumerate()
+                    .rfind(|(_, s)| s.is_some())
+                    .map(|(i, _)| i);
+                if let Some(bucket) = best_bucket {
+                    if let Some(snap) = checkpoint_table[bucket].clone() {
+                        for _ in 0..burst_repeats {
+                            total_bursts += 1;
+                            checkpoint_burst(
+                                bucket, &snap, zone_cfg.as_ref(), &burst_fields,
+                                frame_size, rollout_frames, &crashes_dir,
+                                struct_size, fillhead_info, &mut checkpoint_table,
+                            );
+                        }
+                    }
+                }
+            }
+            CheckpointStrategy::RoundRobin => {
+                // Distribute burst_repeats evenly across all filled checkpoints,
+                // highest to lowest, so intermediate states are also explored.
+                let filled: Vec<(usize, Vec<u8>)> = checkpoint_table
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| s.clone().map(|snap| (i, snap)))
+                    .rev()
+                    .collect();
+                if !filled.is_empty() {
+                    let per_bucket = (burst_repeats / filled.len()).max(1);
+                    for (bucket, snap) in &filled {
+                        for _ in 0..per_bucket {
+                            total_bursts += 1;
+                            checkpoint_burst(
+                                *bucket, snap, zone_cfg.as_ref(), &burst_fields,
+                                frame_size, rollout_frames, &crashes_dir,
+                                struct_size, fillhead_info, &mut checkpoint_table,
+                            );
+                        }
+                    }
                 }
             }
         }
