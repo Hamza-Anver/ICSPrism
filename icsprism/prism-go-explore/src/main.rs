@@ -1104,11 +1104,9 @@ fn generate_zone_frames(
 // ---------------------------------------------------------------------------
 
 /// Restore PLC state from `snapshot` then run `rollout_frames` zone-appropriate
-/// input frames in a forked child. If the child dies by signal (abort/segfault),
-/// save the frames as a crash artifact and exit.
-///
-/// The child nulls out all shared coverage pointers before executing so that
-/// LibAFL's shmem regions are not corrupted by the burst's SanitizerCov callbacks.
+/// input frames in a forked child. The child tracks its FillHead peak and writes
+/// it back via CHECKPOINT_MAP_PTR so the parent can record new checkpoint advances.
+/// If the child dies by signal, save the frames as a crash artifact and exit.
 fn checkpoint_burst(
     bucket: usize,
     snapshot: &[u8],
@@ -1118,6 +1116,8 @@ fn checkpoint_burst(
     rollout_frames: usize,
     crashes_dir: &Path,
     struct_size: usize,
+    fillhead_info: Option<(usize, usize)>,
+    checkpoint_table: &mut Vec<Option<Vec<u8>>>,
 ) {
     if frame_size == 0 || rollout_frames == 0 || snapshot.len() < struct_size {
         return;
@@ -1125,8 +1125,10 @@ fn checkpoint_burst(
 
     // Generate frames: zone-aware if config present, random otherwise.
     let frames = if let Some(zc) = zone_config {
-        // Target the zone AHEAD of where the checkpoint is, to push FillHead forward.
-        let zone_id = ((bucket / 8) + 1).min(zc.zones.len().saturating_sub(1));
+        // Use the current zone — its PVsum and PipeTemp windows match where FillHead
+        // is now. Targeting the next zone would push PipeTemp outside zone bounds,
+        // triggering decay that resets FillHead rather than advancing it.
+        let zone_id = (bucket / 8).min(zc.zones.len().saturating_sub(1));
         let zone = &zc.zones[zone_id];
         static BURST_COUNTER: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(0);
@@ -1149,10 +1151,14 @@ fn checkpoint_burst(
         )
     } else {
         // No zone config: generate random frames (graceful degradation).
+        static BURST_COUNTER_RAND: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let burst_id = BURST_COUNTER_RAND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x1337);
+            .unwrap_or(0x1337)
+            ^ burst_id.wrapping_mul(0x517c_c1b7_2722_0a95);
         let mut rng = StdRand::with_seed(seed);
         let mut f = vec![0u8; frame_size * rollout_frames];
         for b in &mut f {
@@ -1161,6 +1167,14 @@ fn checkpoint_burst(
         f
     };
 
+    // Reset the checkpoint flag before forking so a stale value from the last
+    // fuzz_one can't be mistaken for the burst child's result.
+    unsafe {
+        if !CHECKPOINT_MAP_PTR.is_null() {
+            *CHECKPOINT_MAP_PTR = 0;
+        }
+    }
+
     let child = unsafe { libc::fork() };
     if child < 0 {
         eprintln!("[goexplore] fork() failed for burst at bucket={bucket}");
@@ -1168,26 +1182,71 @@ fn checkpoint_burst(
     }
 
     if child == 0 {
-        // Child: disable coverage shmem writes so we don't corrupt LibAFL's maps.
+        // Child: null coverage maps to avoid corrupting LibAFL's shmem, but keep
+        // CHECKPOINT_MAP_PTR live so we can report the burst's FillHead peak back.
         unsafe {
             COV_MAP_PTR = std::ptr::null_mut();
             STATE_MAP_PTR = std::ptr::null_mut();
-            CHECKPOINT_MAP_PTR = std::ptr::null_mut();
         }
-        execute_testcase_from_checkpoint(snapshot, &frames, frame_size, &mut |_| {});
+
+        let mut burst_fillhead_max = -1i32;
+        let mut burst_best_snap = vec![0u8; struct_size];
+
+        execute_testcase_from_checkpoint(snapshot, &frames, frame_size, &mut |snap| {
+            if let Some((off, sz)) = fillhead_info {
+                let v = read_i32_from_state(snap, off, sz);
+                if v > burst_fillhead_max {
+                    burst_fillhead_max = v;
+                    let n = snap.len().min(burst_best_snap.len());
+                    burst_best_snap[..n].copy_from_slice(&snap[..n]);
+                }
+            }
+        });
+
+        // Write the burst's FillHead peak via checkpoint shmem so the parent can
+        // record any advance. Only write if we observed positive FillHead.
+        if burst_fillhead_max > 0 {
+            unsafe {
+                if !CHECKPOINT_MAP_PTR.is_null() {
+                    *CHECKPOINT_MAP_PTR = 1;
+                    *CHECKPOINT_MAP_PTR.add(1) = burst_fillhead_max.min(64) as u8;
+                    std::ptr::copy_nonoverlapping(
+                        burst_best_snap.as_ptr(),
+                        CHECKPOINT_MAP_PTR.add(CHECKPOINT_HDR),
+                        burst_best_snap.len().min(struct_size),
+                    );
+                }
+            }
+        }
+
         unsafe { libc::_exit(0) };
     }
 
-    // Parent: wait for child and check whether it crashed.
+    // Parent: wait for child, then read any burst checkpoint advance before
+    // checking crash so we don't miss advances from a crashing burst.
     let mut status: libc::c_int = 0;
     unsafe { libc::waitpid(child, &mut status, 0) };
 
+    if unsafe { !CHECKPOINT_MAP_PTR.is_null() && *CHECKPOINT_MAP_PTR == 1 } {
+        let burst_bucket = unsafe { *CHECKPOINT_MAP_PTR.add(1) } as usize;
+        // Only record a genuine advance beyond the starting checkpoint.
+        if burst_bucket < 65 && burst_bucket > bucket && checkpoint_table[burst_bucket].is_none() {
+            let mut snap = vec![0u8; struct_size];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    CHECKPOINT_MAP_PTR.add(CHECKPOINT_HDR),
+                    snap.as_mut_ptr(),
+                    struct_size,
+                );
+            }
+            checkpoint_table[burst_bucket] = Some(snap);
+            eprintln!("[goexplore] burst advance: bucket {bucket} → {burst_bucket}");
+        }
+    }
+
     if libc::WIFSIGNALED(status) {
         let sig = libc::WTERMSIG(status);
-        eprintln!(
-            "[goexplore] CRASH from burst at FillHead bucket={bucket} signal={sig}"
-        );
-        // Save snapshot + frames so the crash is reproducible.
+        eprintln!("[goexplore] CRASH from burst at FillHead bucket={bucket} signal={sig}");
         let crash_path = crashes_dir.join(format!("checkpoint_crash_bucket{bucket}"));
         let mut crash_data = snapshot.to_vec();
         crash_data.extend_from_slice(&frames);
@@ -1480,10 +1539,10 @@ fn main() {
             }
         }
 
-        // Write checkpoint shmem when FillHead was observed (>= 0).
-        // The parent reads this after fuzz_one returns and records the snapshot
-        // if it belongs to a new (previously unseen) FillHead bucket.
-        if executed && fillhead_max >= 0 {
+        // Write checkpoint shmem only when FillHead actually advanced above zero.
+        // fillhead_max == 0 means the program ran but FillHead never accumulated
+        // (idle/INIT phase) — that snapshot is useless as a checkpoint starting point.
+        if executed && fillhead_max > 0 {
             unsafe {
                 if !CHECKPOINT_MAP_PTR.is_null() {
                     *CHECKPOINT_MAP_PTR = 1; // flag: new checkpoint available
@@ -1631,18 +1690,22 @@ fn main() {
             .map(|(i, _)| i);
 
         if let Some(bucket) = best_bucket {
-            if let Some(snap) = checkpoint_table[bucket].as_ref() {
+            // Clone the snapshot so we can also pass &mut checkpoint_table to the
+            // burst (which records any new checkpoints the burst discovers).
+            if let Some(snap) = checkpoint_table[bucket].clone() {
                 for _ in 0..burst_repeats {
                     total_bursts += 1;
                     checkpoint_burst(
                         bucket,
-                        snap,
+                        &snap,
                         zone_cfg.as_ref(),
                         &burst_fields,
                         frame_size,
                         rollout_frames,
                         &crashes_dir,
                         struct_size,
+                        fillhead_info,
+                        &mut checkpoint_table,
                     );
                 }
             }
