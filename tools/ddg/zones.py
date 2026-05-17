@@ -8,7 +8,13 @@ from .fields import find_field_offset
 
 
 def _derive_range(comparisons: list[dict]) -> tuple[int | None, int | None]:
-    """Extract tightest (lo, hi) from a field's comparison list."""
+    """Extract tightest (lo, hi) from a field's comparison list.
+
+    When a field has both upper-bound (slt/sle) and lower-bound (sgt/sge)
+    comparisons, any lower-bound whose value >= the minimum upper-bound is a
+    fault-gate or OOB condition rather than a driver window — drop it so the
+    range reflects the beneficial accumulation window, not the fault trigger.
+    """
     lo_candidates: list[int] = []
     hi_candidates: list[int] = []
     for cmp in comparisons:
@@ -22,6 +28,9 @@ def _derive_range(comparisons: list[dict]) -> tuple[int | None, int | None]:
             hi_candidates.append(thr)
         elif pred in ("slt", "ult"):
             hi_candidates.append(thr - 1)
+    if lo_candidates and hi_candidates:
+        min_hi = min(hi_candidates)
+        lo_candidates = [l for l in lo_candidates if l < min_hi]
     lo = max(lo_candidates) if lo_candidates else None
     hi = min(hi_candidates) if hi_candidates else None
     return lo, hi
