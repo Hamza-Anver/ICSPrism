@@ -28,7 +28,7 @@ echo "[4/10] prism-analyze -> DDG + layout"
 $ANALYZE "$TARGET/$NAME.ll" "$TARGET/$NAME"
 
 echo "[5/10] Rendering DDG DOT"
-python3 ./tools/ddg_to_dot.py "$TARGET/${NAME}_ddg.json" "$TARGET/${NAME}_ddg.dot"
+PYTHONPATH=./tools python3 -m ddg to-dot "$TARGET/${NAME}_ddg.json" "$TARGET/${NAME}_ddg.dot"
 
 echo "[6/10] Building prism-harness"
 cargo build --bin prism-harness --manifest-path ./icsprism/Cargo.toml -q
@@ -47,7 +47,7 @@ echo "[7/10] Generating C harness for $PROGRAM_NAME"
 $HARNESS "$TARGET/${NAME}_layout.json" "$PROGRAM_NAME" "$TARGET/${NAME}_harness.c"
 
 echo "[8/11] Saving harness heuristics JSON"
-python3 ./tools/ddg_analysis/ddg_state_hash_heuristics.py \
+PYTHONPATH=./tools python3 -m ddg state-hash \
     "$TARGET/${NAME}_ddg.json" \
     "$TARGET/${NAME}_layout.json" \
     --json "$TARGET/${NAME}_harness_heuristics.json"

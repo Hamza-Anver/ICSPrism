@@ -3,7 +3,7 @@
 #
 # Full pipeline for prism-go-explore:
 #   1. Compile ST → shared library + harness (stc.sh)
-#   2. Generate byte-weight + input-field guide (probe_ddg_adv.py)
+#   2. Generate byte-weight + input-field guide (python3 -m ddg probe-adv)
 #   3. Launch prism-go-explore with weights, state-hash, and zone constraints
 set -euo pipefail
 
@@ -65,7 +65,7 @@ STATE_HASH_JSON="$TARGET/${NAME}_harness_heuristics.json"
 ZONE_CONSTRAINTS_JSON="$TARGET/${NAME}_zone_constraints.json"
 
 echo "[goexplore] Generating input-field weights..."
-python3 "$ROOT/tools/ddg_analysis/probe_ddg_adv.py" \
+PYTHONPATH="$ROOT/tools" python3 -m ddg probe-adv \
     "$TARGET/${NAME}_ddg.json" \
     "$TARGET/${NAME}_layout.json" \
     --json "$WEIGHTS_JSON"
@@ -78,7 +78,7 @@ fi
 # Auto-generate zone constraints if not already present.
 if [[ ! -f "$ZONE_CONSTRAINTS_JSON" ]]; then
     echo "[goexplore] Zone constraints not found — auto-generating from weights + layout..."
-    python3 "$ROOT/tools/ddg_analysis/probe_goexplore_zones.py" \
+    PYTHONPATH="$ROOT/tools" python3 -m ddg zones \
         "$WEIGHTS_JSON" \
         "$TARGET/${NAME}_layout.json" \
         --output "$ZONE_CONSTRAINTS_JSON"

@@ -2,7 +2,7 @@
 # Usage: compile_all.sh <file.st> <output_dir>
 # Compiles an ST file to BC, LL, object, instrumented shared library,
 # runs prism-analyze to produce DDG and layout JSON,
-# then renders the DDG DOT file via tools/ddg_to_dot.py.
+# then renders the DDG DOT file via python3 -m ddg to-dot.
 
 set -e
 
@@ -46,7 +46,7 @@ echo "[6/7] Running prism-analyze -> DDG + layout JSON"
 $ANALYZE "$TARGET/$NAME.ll" "$TARGET/$NAME"
 
 echo "[7/7] Rendering DDG DOT"
-python3 ./tools/ddg_to_dot.py "$TARGET/${NAME}_ddg.json" "$TARGET/${NAME}_ddg.dot"
+PYTHONPATH=./tools python3 -m ddg to-dot "$TARGET/${NAME}_ddg.json" "$TARGET/${NAME}_ddg.dot"
 
 echo ""
 echo "Output in $TARGET/"

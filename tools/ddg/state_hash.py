@@ -203,9 +203,9 @@ def _bucket_for_icmp(comparisons: list) -> dict:
         thresholds = sorted({t for _, t in effective if t >= 0})
         if not thresholds:
             return {"scheme": "binary", "thresholds": [0], "bucket_count": 2,
-                    "note": "no non-negative threshold, fallback binary"}
+                    "note": "no non-negative threshold found, fallback binary"}
         return {"scheme": "binary", "thresholds": thresholds, "bucket_count": 2,
-                "note": f"lower-bound only, binary split at {thresholds[0]}"}
+                "note": f"lower-bound only comparisons, binary split at {thresholds[0]}"}
 
     max_fv = max(firing_values)
     thresholds_out = sorted({t for _, t in effective if t >= 0})

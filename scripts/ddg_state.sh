@@ -3,7 +3,7 @@
 #
 # Full pipeline for prism-ddg-state:
 #   1. Compile ST → shared library + harness (stc.sh)
-#   2. Generate byte-weight + input-field guide  (probe_ddg_adv.py)
+#   2. Generate byte-weight + input-field guide  (python3 -m ddg probe-adv)
 #   3. Launch prism-ddg-state with generated heuristics + weights
 set -euo pipefail
 
@@ -64,7 +64,7 @@ WEIGHTS_JSON="$TARGET/${NAME}_weights.json"
 STATE_HASH_JSON="$TARGET/${NAME}_harness_heuristics.json"
 
 echo "[ddg_state] Generating input-field weights..."
-python3 "$ROOT/tools/ddg_analysis/probe_ddg_adv.py" \
+PYTHONPATH="$ROOT/tools" python3 -m ddg probe-adv \
     "$TARGET/${NAME}_ddg.json" \
     "$TARGET/${NAME}_layout.json" \
     --json "$WEIGHTS_JSON"
