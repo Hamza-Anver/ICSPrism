@@ -1,15 +1,231 @@
-# Copilot instructions for ICSPrism
+# ICSPrism — Codebase Overview
 
-## What matters here
-- Treat [icsprism/](icsprism) as the active workspace. The code you usually want is in `ir-analysis`, `prism-runtime`, `prism-cov`, `prism-ddg`, `prism-ddg-input`, and `prism-sanity`.
-- Treat [rusty/](rusty) as an upstream submodule dependency unless the task explicitly concerns the compiler itself.
-- Prefer linking to [README.md](README.md) for broad project context instead of restating it here.
+ICSPrism is a fuzzing framework for ICS PLC programs written in Structured Text (ST).
+It compiles ST programs to LLVM IR, analyzes the IR to extract field semantics and
+data-dependency structure, then fuzzes the compiled shared library with coverage and
+state-aware feedback to find bugs (typically triggered by `prism_bug_abort_if`).
+
+---
+
+## Repository layout
+
+```
+ICSPrism/
+├── rusty/                      # submodule — RuSTy ST compiler (LLVM 21)
+├── icsprism/                   # Rust workspace — analysis + fuzzer binaries
+│   ├── ir-analysis/            # LLVM IR analysis: layout + DDG extraction
+│   ├── prism-runtime/          # shared library ABI wrapper + execution primitives
+│   ├── prism-cov/              # baseline AFL-style fuzzer (coverage only)
+│   ├── prism-ddg/              # DDG-weighted byte mutations
+│   ├── prism-ddg-not-dumb/     # DDG + field-role-aware mutations
+│   ├── prism-ddg-state/        # DDG + secondary state-hash coverage signal
+│   └── prism-go-explore/       # Go-Explore: checkpoint + zone-burst fuzzer
+├── tools/
+│   └── ddg/                    # Python analysis package (run via python -m ddg <cmd>)
+│       ├── __main__.py         # CLI entry point
+│       ├── graph.py            # DDG → NetworkX DiGraph builder
+│       ├── fields.py           # ICmp/GEP resolution, layout field lookups
+│       ├── io.py               # JSON loader helpers
+│       ├── probe.py            # basic proximity score probe
+│       ├── probe_adv.py        # semantic analysis → _weights.json
+│       ├── state_hash.py       # state variable selection → _harness_heuristics.json
+│       ├── to_dot.py           # DDG → GraphViz DOT
+│       └── zones.py            # zone constraint derivation → _zone_constraints.json
+├── scripts/
+│   ├── stc.sh                  # 11-step ST → shared library pipeline
+│   ├── ddg_goexplore.sh        # end-to-end go-explore launcher
+│   ├── ddg_fuzz.sh             # ddg fuzzer launcher
+│   ├── ddg_state.sh            # ddg-state fuzzer launcher
+│   ├── cov_fuzz.sh             # coverage fuzzer launcher
+│   └── compile_*.sh            # individual compile sub-steps
+└── benchmarks/                 # ST benchmark programs + compiled artifacts (benchmarks/out/)
+```
+
+---
+
+## Full pipeline
+
+### Step 1 — ST compilation (`stc.sh`)
+`rusty/target/debug/plc` compiles `<name>.st` into `<name>.bc` (bitcode) and `<name>.ll`
+(LLVM IR text) with debug info (`-g`) and without optimization.
+
+### Step 2 — IR analysis (`prism-analyze`)
+`ir-analysis` reads the LLVM IR using inkwell and produces:
+- `<name>_layout.json` — array of struct descriptors (struct_name, total_bytes, fields[]).
+  Each field has name, llvm_type, byte_offset, byte_size.
+  The **last entry** is the top-level program struct.
+- `<name>_ddg.json` — Data Dependency Graph.
+  Nodes carry: id, function, basic_block, opcode, ir, defines, callee, has_dynamic_index.
+  Edges carry: from, to, kind (data_ssa | data_memory | memory_overwrite), symbol.
+
+### Step 3 — C harness generation (`prism-harness`)
+Reads the layout JSON and emits `<name>_harness.c` that exposes:
+```c
+void*  prism_alloc()                           // allocate zeroed PLC struct
+void   prism_reset(void* inst)                 // zero struct (keep vtable)
+void   prism_free(void* inst)
+void   prism_run(void* inst, uint8_t* frame, size_t len)  // set inputs + run one scan
+void   prism_step(void* inst)                  // run one scan without changing inputs
+void   prism_get_state(void* inst, uint8_t* out)
+void   prism_set_state(void* inst, uint8_t* state, size_t len)
+size_t prism_state_size(), prism_input_size(), prism_struct_size()
+char*  prism_program_name()
+uint32_t prism_field_count()
+char*  prism_field_name(uint32_t idx)
+size_t prism_field_size(uint32_t idx), prism_field_offset(uint32_t idx)
+int    prism_field_is_input(uint32_t idx)
+size_t prism_get_field(void* inst, uint32_t idx, uint8_t* out)
+int    prism_set_field(void* inst, uint32_t idx, uint8_t* data, size_t len)
+```
+This ABI is stable across all fuzzer variants. `prism_field_is_input` distinguishes
+VAR_INPUT fields from internal state.
+
+### Step 4 — Compilation
+clang-21 compiles the instrumented LLVM IR (`-fsanitize-coverage=trace-pc-guard`) and
+the C harness into a shared library `lib<name>.so`.
+Fuzzers load the library at link-time via `PRISM_LIB_DIR` + `PRISM_LIB_NAME` env vars
+set by the build scripts, which are consumed by `build.rs` in each fuzzer crate.
+
+### Step 5 — Python analysis (`tools/ddg`)
+All subcommands are run as `PYTHONPATH=./tools python3 -m ddg <cmd>`.
+
+**`probe-adv`** (`probe_adv.py`) → `_weights.json`
+- Finds `prism_bug_abort_if` call sites → resolves the guarding ICmp → (field, pred, threshold).
+  This gives the "abort target" and "discriminant" field (e.g. FillHead).
+- Finds all ICmp comparisons and store-guard relationships in the main function.
+- Builds an accumulation chain: walks backward from the abort field to reconstruct the
+  causal sequence of state variables that must accumulate for the abort to fire.
+- Classifies each VAR_INPUT field into roles:
+  - `inhibitor` — when non-zero, triggers a reset of a chain variable
+  - `driver` — guards an increment of a chain variable
+  - `activator` — gates a non-chain state write
+  - `fault_gate` — appears only in the abort guard (sgt with high threshold)
+  - `neutral` — no structural role found
+- Computes per-byte weights: inhibitors=1.0, drivers=0.9, activators=0.7, neutral=0.1.
+- Outputs per-field `target_values` (boundary ± 1 values around each ICmp threshold).
+
+**`state-hash`** (`state_hash.py`) → `_harness_heuristics.json`
+- Selects internal state variables (not inputs) that have ICmp comparisons or GEP sinks.
+- Assigns a bucket scheme per variable:
+  - `identity` — switch dispatch (small discrete set)
+  - `threshold_fine` — fine-grained 0..N (small ICmp threshold)
+  - `threshold_log2` — log2-spaced buckets (large threshold)
+  - `raw_capped` — raw value 0..bound-1 + OOB (small array bound)
+  - `binary` — fallback
+- Marks `high_watermark = true` for accumulating variables (with reset stores or GEP sinks).
+  Fuzzers track the per-run maximum of these rather than their current value.
+
+**`zones`** (`zones.py`) → `_zone_constraints.json`
+- Reads the discriminant field from `_weights.json` abort_targets.
+- Divides the discriminant's [0, max_fillhead] range evenly into N zones (default 8).
+- For each non-inhibitor input field, derives [lo, hi] from its ICmp comparisons.
+  Higher zone index → progressively tighter range (up to 40% narrowing at the last zone).
+- Optionally extracts sub-accumulator fields (state variables that gate the discriminant's
+  increment) using one of three strategies (priority order):
+  1. DDG backward BFS from discriminant increment stores through CFG branch guards
+  2. High-watermark fields from the state-hash heuristics JSON
+  3. `accumulation_chain.accumulation_guards` from the weights JSON
+
+---
+
+## prism-runtime
+
+Shared library depended on by all fuzzer binaries. Key exports:
+
+| Function | Purpose |
+|---|---|
+| `load_config()` | Load `prism-fuzz.toml` (or default) |
+| `harness_dimensions()` | Return input_size, state_size, struct_size from harness |
+| `required_input_len()` | Total bytes needed for configured execution mode |
+| `execute_testcase()` | Run one testcase (simple, no snapshot) |
+| `execute_testcase_with_state_snapshots()` | Run + call closure after every scan cycle with the full struct snapshot |
+| `execute_testcase_from_checkpoint()` | Restore snapshot, then run new frames — core Go-Explore primitive |
+| `Instance` | RAII wrapper around a heap-allocated PLC instance |
+
+### Execution modes (`prism-fuzz.toml` or config file)
+- `SingleCycle` — one input frame per testcase (default)
+- `ScanSequence` — `cycles` frames per testcase, with optional `warmup_cycles`
+
+---
+
+## prism-go-explore
+
+The most sophisticated fuzzer. Uses Go-Explore: interleave standard mutation with
+checkpoint-and-burst exploration.
+
+### Data structures
+- **Checkpoint table** — `Vec<Option<(snapshot: Vec<u8>, quality: u32)>>` indexed by
+  discriminant bucket value (0..max_fillhead). One slot per possible discriminant value.
+- **State hash fields** — parsed from `_harness_heuristics.json`; drive a secondary
+  `StdMapObserver` fed into LibAFL's `MaxMapFeedback`.
+- **Zone constraints** — parsed from `_zone_constraints.json`; drive burst frame generation.
+- **Input fields** — parsed from either `_weights.json` (preferred) or inferred from DDG.
+
+### Main loop
+```
+loop {
+  // Phase 1: standard LibAFL mutation fuzzing
+  for _ in 0..burst_size {
+      fuzzer.fuzz_one(...)   // normal LibAFL iteration
+      // harness closure: tracks state hash HWM + FillHead peak, writes to checkpoint shmem
+      // parent: reads checkpoint shmem, updates checkpoint table
+  }
+
+  // Phase 2: checkpoint bursts
+  for each selected checkpoint (Best or RoundRobin strategy):
+      for _ in 0..burst_repeats:
+          checkpoint_burst(bucket, snapshot, zone_config, ...)
+}
+```
+
+### Checkpoint shmem IPC
+A shared memory region of size `CHECKPOINT_HDR + struct_size`:
+- Byte 0: flag (1 = new checkpoint available)
+- Byte 1: discriminant bucket value
+- Bytes 2..: PLC struct snapshot
+
+The harness closure (running inside `InProcessForkExecutor`'s child) writes here after
+each testcase. The parent reads after each `fuzz_one` call.
+`checkpoint_burst` also uses this region to pass burst-found checkpoints back.
+
+### Zone-aware burst frame generation
+For each burst:
+1. Resolve current zone from bucket value.
+2. If within `RAMP_WINDOW` buckets of zone boundary: generate 70% current-zone frames
+   + 30% next-zone frames to help transition across the boundary.
+3. Each frame: inhibitors → 0, zone-constrained fields → uniform sample from [lo, hi],
+   other I16 fields → 80% from target_values list / 20% random, booleans → random 0/1.
+
+### Mutator stack
+1. `FieldValueMutator` — DDG-score-weighted field selection, model-appropriate values
+2. `FramePatternMutator` — copy frames, pulse activators, blank inhibitors
+3. `InputRangeMutator` — byte-weight-guided field selection, sample from candidate list
+4. `AccumulationWindowMutator` — replace a window of frames with accumulation-friendly values
+5. `DdgByteMutator` — byte-weight-guided single-byte mutation
+6. LibAFL `havoc_mutations()` — standard havoc stack
+
+---
+
+## Artifact naming conventions
+
+| Artifact | Producer | Consumer |
+|---|---|---|
+| `<name>.ll`, `<name>.bc` | RuSTy (`plc`) | prism-analyze, clang |
+| `<name>_layout.json` | prism-analyze | prism-harness, all fuzzers, Python tools |
+| `<name>_ddg.json` | prism-analyze | Python tools, prism-go-explore (DDG analysis) |
+| `<name>_ddg.dot` | `ddg to-dot` | Graphviz (human review) |
+| `<name>_harness.c` | prism-harness | clang |
+| `lib<name>.so` | clang | all fuzzer binaries (dlopen at build time) |
+| `<name>_weights.json` | `ddg probe-adv` | prism-go-explore, `ddg zones` |
+| `<name>_harness_heuristics.json` | `ddg state-hash` | prism-ddg-state, prism-go-explore, `ddg zones` |
+| `<name>_zone_constraints.json` | `ddg zones` | prism-go-explore |
+
+---
 
 ## Build and validation
-Run commands from the repository root unless the script says otherwise.
 
 | Task | Command |
-| --- | --- |
+|---|---|
 | Build the ICSPrism workspace | `cargo build --manifest-path icsprism/Cargo.toml` |
 | Build one crate | `cargo build --manifest-path icsprism/Cargo.toml -p ir-analysis` |
 | Build one binary | `cargo build --manifest-path icsprism/Cargo.toml --bin prism-analyze` |
@@ -17,22 +233,20 @@ Run commands from the repository root unless the script says otherwise.
 | Lint | `cargo clippy --manifest-path icsprism/Cargo.toml --workspace --all-targets` |
 | Format | `cargo fmt --all --manifest-path icsprism/Cargo.toml` |
 
-- For RuSTy builds, set `LLVM_SYS_211_PREFIX=$(llvm-config-21 --prefix)` first; the README’s build note is the source of truth.
-- Prefer the narrowest command that validates the touched slice. Use the workspace test/build commands above before broader checks.
+Set `LLVM_SYS_211_PREFIX=$(llvm-config-21 --prefix)` before RuSTy/inkwell builds.
 
-## Workflow conventions
-- Use the helper scripts in [scripts/](scripts) for end-to-end ST compilation and fuzzing flows: `compile_ll_bc.sh`, `compile_o_so.sh`, `compile_all.sh`, `stc.sh`, `stc_prism_cov_fuzz`, `stc_prism_ddg_fuzz`, and `stc_prism_ddg_input_fuzz`.
-- `prism-runtime` owns shared execution and config loading for the fuzzers. Default execution mode is `SingleCycle`; switch to `scan_sequence` in config when a benchmark needs state to persist across cycles.
-- Multi-cycle accumulator programs such as `pump_controller` are the main place this matters. If a fuzzing run stalls at baseline coverage, check the execution mode before changing analysis code.
-- `prism-ddg-input` mutates compact input bytes, not the full PLC frame; keep field offset and layout JSON handling consistent with that model.
+End-to-end run: `./scripts/ddg_goexplore.sh benchmarks/pump_controller.st icsprism/goexplore-config.toml`
 
-## Artifact and analysis conventions
-- The common outputs are `<prefix>_layout.json`, `<prefix>_ddg.json`, `<prefix>_weights.json`, `<prefix>_harness.c`, and `lib<prefix>.so`.
-- Layout JSON is an array; fuzzers use the last entry as the top-level program struct.
-- DDG analysis lives in [tools/probe_ddg_adv.py](tools/probe_ddg_adv.py) and [tools/ddg_to_dot.py](tools/ddg_to_dot.py). Link to those tools instead of duplicating their logic here.
-- `probe_ddg_adv.py` is the place to reason about control-flow guards, source-level field roles, and byte-weight generation.
+---
 
-## Editing rules
-- Keep changes focused on the active crate or script path; avoid rewriting generated artifacts under `target/`.
-- Preserve existing file and output naming conventions so the scripts and build scripts continue to line up.
-- If a benchmark or fuzzer behavior looks off, inspect the local crate or script first before broadening the search.
+## Editing conventions
+
+- `prism-runtime` owns all harness ABI interaction and execution primitives.
+  Add new execution patterns here, not in individual fuzzer `main.rs` files.
+- Layout JSON last-entry convention: code that reads layout always uses `layouts.last()`.
+- `prism_field_is_input` is the canonical way to distinguish VAR_INPUT from state fields.
+- Artifact naming is `<name>_<kind>.json` and `lib<name>.so`. Do not rename.
+- Changes to `harness_gen.rs` (prism-harness output) must stay consistent with
+  `prism-runtime/src/lib.rs` `extern "C"` declarations.
+- Keep RuSTy (`rusty/`) as a read-only upstream dependency unless the task concerns
+  the ST compiler itself.
