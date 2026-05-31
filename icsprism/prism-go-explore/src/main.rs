@@ -37,7 +37,7 @@ use prism_runtime::fuzzing::{
     StateHashField, SubAccumulatorField, WeightsJson, build_ddg_distances,
     build_name_scores, build_runtime_input_fields, compute_bucket, ddg_byte_weights,
     expand_weights_for_sequence, infer_i16_targets_from_ddg, input_fields_from_weights_json,
-    parse_state_hash_config, read_i32_from_state, snapshot_quality,
+    checkpoint_score, parse_state_hash_config, read_i32_from_state, snapshot_quality,
     COV_MAP_SIZE, STATE_MAP_SIZE,
 };
 use serde::Deserialize;
@@ -854,14 +854,9 @@ fn main() {
                         if is_new {
                             let n_chk =
                                 checkpoint_table.iter().filter(|s| s.is_some()).count();
-                            let best = checkpoint_table
-                                .iter()
-                                .enumerate()
-                                .rfind(|(_, s)| s.is_some())
-                                .map(|(i, _)| i)
-                                .unwrap_or(0);
+                            let distance = max_discriminant.saturating_sub(bucket);
                             eprintln!(
-                                "[goexplore] NEW checkpoint: bucket={bucket} quality={quality} | total_checkpoints={n_chk} | best_bucket={best}"
+                                "[goexplore] NEW checkpoint: bucket={bucket} dist={distance} quality={quality} | total={n_chk}"
                             );
                         }
                     }
@@ -873,60 +868,110 @@ fn main() {
         if last_heartbeat.elapsed() >= heartbeat_interval {
             last_heartbeat = std::time::Instant::now();
             let elapsed = start_time.elapsed().as_secs_f64();
-            let filled: Vec<String> = checkpoint_table
+            let max_quality_all = checkpoint_table
+                .iter()
+                .filter_map(|s| s.as_ref().map(|(_, q)| *q))
+                .max()
+                .unwrap_or(1);
+            let filled_desc: Vec<String> = checkpoint_table
                 .iter()
                 .enumerate()
-                .filter(|(_, s)| s.is_some())
-                .map(|(i, _)| i.to_string())
+                .filter_map(|(i, s)| {
+                    s.as_ref().map(|(_, q)| {
+                        let dist = max_discriminant.saturating_sub(i);
+                        let score =
+                            checkpoint_score(i, *q, max_discriminant, max_quality_all);
+                        format!("{i}(dist={dist},s={score:.2})")
+                    })
+                })
                 .collect();
-            let best = checkpoint_table
+            // Best = highest composite score (lowest distance + best quality).
+            let best_score_bucket = checkpoint_table
                 .iter()
                 .enumerate()
-                .rfind(|(_, s)| s.is_some())
-                .map(|(i, _)| i.to_string())
+                .filter_map(|(i, s)| {
+                    s.as_ref().map(|(_, q)| {
+                        (i, checkpoint_score(i, *q, max_discriminant, max_quality_all))
+                    })
+                })
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i)
+                .map(|i| i.to_string())
                 .unwrap_or_else(|| "none".to_string());
             eprintln!(
-                "[goexplore] t={:.0}s | fuzz_iters={total_fuzz_iters} ({:.0}/s) | bursts={total_bursts} | checkpoints=[{}] | best_bucket={best}",
+                "[goexplore] t={:.0}s | fuzz_iters={total_fuzz_iters} ({:.0}/s) | bursts={total_bursts} | checkpoints=[{}] | best_bucket={best_score_bucket}",
                 elapsed,
                 total_fuzz_iters as f64 / elapsed.max(0.001),
-                filled.join(","),
+                filled_desc.join(","),
             );
         }
 
         // Phase 2: burst from checkpoints.
+        //
+        // Checkpoint selection is driven by checkpoint_score(), which weights
+        // discriminant closeness (70%) and accumulator health (30%).  This prevents
+        // wasting burst budget on a high-discriminant snapshot whose sub-accumulators
+        // have fully decayed (and which will immediately regress under zone decay).
+        let max_quality_now = checkpoint_table
+            .iter()
+            .filter_map(|s| s.as_ref().map(|(_, q)| *q))
+            .max()
+            .unwrap_or(1);
+
         match checkpoint_strategy {
             CheckpointStrategy::Best => {
-                let best_bucket = checkpoint_table
+                // Select the single checkpoint with the highest composite score.
+                let best = checkpoint_table
                     .iter()
                     .enumerate()
-                    .rfind(|(_, s)| s.is_some())
-                    .map(|(i, _)| i);
-                if let Some(bucket) = best_bucket {
-                    if let Some((snap, _quality)) = checkpoint_table[bucket].clone() {
-                        for _ in 0..burst_repeats {
-                            total_bursts += 1;
-                            checkpoint_burst(
-                                bucket, &snap, zone_cfg.as_ref(), &burst_state_fields,
-                                &burst_fields, frame_size, rollout_frames, &crashes_dir,
-                                struct_size, discriminant_info, &mut checkpoint_table,
-                                chk_gen,
-                            );
-                            chk_gen = chk_gen.wrapping_add(1);
-                        }
+                    .filter_map(|(i, s)| {
+                        s.as_ref().map(|(snap, q)| {
+                            let score =
+                                checkpoint_score(i, *q, max_discriminant, max_quality_now);
+                            (i, snap.clone(), score)
+                        })
+                    })
+                    .max_by(|a, b| {
+                        a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                if let Some((bucket, snap, _score)) = best {
+                    for _ in 0..burst_repeats {
+                        total_bursts += 1;
+                        checkpoint_burst(
+                            bucket, &snap, zone_cfg.as_ref(), &burst_state_fields,
+                            &burst_fields, frame_size, rollout_frames, &crashes_dir,
+                            struct_size, discriminant_info, &mut checkpoint_table,
+                            chk_gen,
+                        );
+                        chk_gen = chk_gen.wrapping_add(1);
                     }
                 }
             }
             CheckpointStrategy::RoundRobin => {
-                let filled: Vec<(usize, Vec<u8>)> = checkpoint_table
+                // Collect filled entries with their composite scores.
+                let filled: Vec<(usize, Vec<u8>, f64)> = checkpoint_table
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, s)| s.clone().map(|(snap, _q)| (i, snap)))
-                    .rev()
+                    .filter_map(|(i, s)| {
+                        s.as_ref().map(|(snap, q)| {
+                            let score =
+                                checkpoint_score(i, *q, max_discriminant, max_quality_now);
+                            (i, snap.clone(), score)
+                        })
+                    })
                     .collect();
+
                 if !filled.is_empty() {
-                    let per_bucket = (burst_repeats / filled.len()).max(1);
-                    for (bucket, snap) in &filled {
-                        for _ in 0..per_bucket {
+                    let total_score: f64 = filled.iter().map(|(_, _, s)| s).sum();
+                    let total_score = total_score.max(1e-9);
+
+                    for (bucket, snap, score) in &filled {
+                        // Each bucket receives burst_repeats proportional to its
+                        // composite score, with at least 1 burst guaranteed.
+                        let bursts_for_bucket = ((burst_repeats as f64 * score / total_score)
+                            .round() as usize)
+                            .max(1);
+                        for _ in 0..bursts_for_bucket {
                             total_bursts += 1;
                             checkpoint_burst(
                                 *bucket, snap, zone_cfg.as_ref(), &burst_state_fields,

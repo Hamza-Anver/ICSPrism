@@ -899,6 +899,43 @@ where
     }
 }
 
+// ---------------------------------------------------------------------------
+// Checkpoint quality and scoring
+// ---------------------------------------------------------------------------
+
+/// Composite score used to rank filled checkpoints against each other.
+///
+/// Combines **discriminant closeness** (70%) with **accumulator health** (30%).
+/// Result is in [0.0, 1.0]; higher means a better starting point for a burst.
+///
+/// - `bucket`: discriminant value at the checkpoint (higher = closer to the abort)
+/// - `quality`: sub-accumulator sum from `snapshot_quality` (higher = healthier state)
+/// - `max_discriminant`: maximum possible discriminant value
+/// - `max_quality`: maximum quality seen across all filled checkpoints (used to normalise)
+///
+/// Using closeness without quality sometimes prefers a high-discriminant snapshot whose
+/// accumulators have decayed to zero (and which will immediately regress under zone decay)
+/// over a lower-discriminant snapshot with fully healthy accumulators.  The 30% quality
+/// weight corrects this without discarding the discriminant signal entirely.
+pub fn checkpoint_score(
+    bucket: usize,
+    quality: u32,
+    max_discriminant: usize,
+    max_quality: u32,
+) -> f64 {
+    let closeness = if max_discriminant > 0 {
+        bucket as f64 / max_discriminant as f64
+    } else {
+        1.0
+    };
+    let qual_norm = if max_quality > 0 {
+        quality as f64 / max_quality as f64
+    } else {
+        0.0
+    };
+    0.7 * closeness + 0.3 * qual_norm
+}
+
 /// Single-byte random flip weighted by DDG proximity to sinks.
 pub struct DdgByteMutator {
     picker: WeightedIndex,
