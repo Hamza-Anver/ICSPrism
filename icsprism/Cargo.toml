@@ -9,6 +9,7 @@ members = [
     "prism-ddg-not-dumb",
     "prism-ddg-state",
     "prism-go-explore",
+    "prism-go-explore-progress",
 ]
 
 [workspace.dependencies]

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from . import to_dot, probe, probe_adv, state_hash, zones
+from . import to_dot, probe, probe_adv, state_hash, zones, stages
 
 
 def main() -> None:
@@ -12,11 +12,12 @@ def main() -> None:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    to_dot.add_args(sub.add_parser("to-dot",     help="Render DDG as GraphViz DOT"))
-    probe.add_args(sub.add_parser("probe",        help="Validate DDG proximity scores"))
+    to_dot.add_args(sub.add_parser("to-dot",      help="Render DDG as GraphViz DOT"))
+    probe.add_args(sub.add_parser("probe",         help="Validate DDG proximity scores"))
     probe_adv.add_args(sub.add_parser("probe-adv", help="Semantic DDG analysis + byte weights"))
     state_hash.add_args(sub.add_parser("state-hash", help="Generate state hash config"))
-    zones.add_args(sub.add_parser("zones",        help="Generate zone constraints"))
+    zones.add_args(sub.add_parser("zones",         help="Generate zone constraints"))
+    stages.add_args(sub.add_parser("stages",       help="Extract HDS progress stages for prism-go-explore-progress"))
 
     args = parser.parse_args()
     dispatch = {
@@ -25,6 +26,7 @@ def main() -> None:
         "probe-adv":  probe_adv.run,
         "state-hash": state_hash.run,
         "zones":      zones.run,
+        "stages":     stages.run,
     }
     dispatch[args.command](args)
 
