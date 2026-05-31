@@ -81,7 +81,9 @@ if [[ ! -f "$ZONE_CONSTRAINTS_JSON" ]]; then
     PYTHONPATH="$ROOT/tools" python3 -m ddg zones \
         "$WEIGHTS_JSON" \
         "$TARGET/${NAME}_layout.json" \
-        --output "$ZONE_CONSTRAINTS_JSON"
+        --ddg        "$TARGET/${NAME}_ddg.json" \
+        --state-hash "$STATE_HASH_JSON" \
+        --output     "$ZONE_CONSTRAINTS_JSON"
 fi
 echo "[goexplore] Zone constraints: $ZONE_CONSTRAINTS_JSON"
 

@@ -44,6 +44,8 @@ const COV_MAP_SIZE: usize = 65536;
 const STATE_MAP_SIZE: usize = 1024;
 /// Checkpoint shmem header: [flag: u8][fillhead_bucket: u8]
 const CHECKPOINT_HDR: usize = 2;
+/// How many buckets from the zone boundary to start generating ramp (transition) frames.
+const RAMP_WINDOW: i32 = 2;
 
 static mut COV_MAP_PTR: *mut u8 = std::ptr::null_mut();
 static mut STATE_MAP_PTR: *mut u8 = std::ptr::null_mut();
@@ -167,15 +169,21 @@ struct FieldRange {
 struct ZoneConstraint {
     #[allow(dead_code)]
     id: usize,
-    #[allow(dead_code)]
     fillhead_lo: i32,
-    #[allow(dead_code)]
     fillhead_hi: i32,
     /// Generic per-field constraints: maps field name → [lo, hi] sampling range.
-    /// Only non-inhibitor fields need entries; missing fields fall back to
-    /// sampling from their target_values.
     #[serde(default)]
     field_constraints: std::collections::HashMap<String, FieldRange>,
+}
+
+/// A state variable that directly gates the discriminant's accumulation.
+/// Used to score snapshot quality: higher sum → better starting point for bursts.
+#[derive(Debug, Clone, Deserialize)]
+struct SubAccumulatorField {
+    #[allow(dead_code)]
+    name: String,
+    byte_offset: usize,
+    byte_size: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -188,6 +196,11 @@ struct ZoneConstraintsConfig {
     /// Inclusive upper bound for the discriminant — sets checkpoint table size.
     #[serde(default = "default_max_fillhead")]
     max_fillhead: u32,
+    /// State variables that directly gate discriminant accumulation (from accumulation chain).
+    /// When non-empty, quality = sum of these fields' values in the snapshot.
+    /// When empty, quality falls back to sum of high-watermark state-hash fields.
+    #[serde(default)]
+    sub_accumulator_fields: Vec<SubAccumulatorField>,
     zones: Vec<ZoneConstraint>,
 }
 
@@ -364,6 +377,38 @@ fn compute_bucket(field: &StateHashField, value: i32) -> usize {
             n.min(field.bucket_count - 1)
         }
     }
+}
+
+/// Return the quality score for a snapshot — higher means better accumulators.
+///
+/// If the zone config supplies explicit sub-accumulator fields (state variables
+/// that directly gate the discriminant's increment), sum those.  Otherwise fall
+/// back to summing all high-watermark state-hash fields except the discriminant,
+/// which approximates "how much useful state has built up".
+fn snapshot_quality(
+    snap: &[u8],
+    sub_accum: &[SubAccumulatorField],
+    state_fields: &[StateHashField],
+    discriminant_offset: usize,
+) -> u32 {
+    if !sub_accum.is_empty() {
+        return sub_accum
+            .iter()
+            .map(|f| read_i32_from_state(snap, f.byte_offset, f.byte_size).max(0) as u32)
+            .sum();
+    }
+    state_fields
+        .iter()
+        .filter(|f| f.high_watermark && f.absolute_byte_offset != discriminant_offset)
+        .map(|f| read_i32_from_state(snap, f.absolute_byte_offset, f.byte_size).max(0) as u32)
+        .sum()
+}
+
+/// Return the index into `zones` whose [fillhead_lo, fillhead_hi) contains `bucket`.
+fn find_zone_idx(zones: &[ZoneConstraint], bucket: usize) -> Option<usize> {
+    zones
+        .iter()
+        .position(|z| bucket as i32 >= z.fillhead_lo && (bucket as i32) < z.fillhead_hi)
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,19 +1174,19 @@ fn checkpoint_burst(
     bucket: usize,
     snapshot: &[u8],
     zone_config: Option<&ZoneConstraintsConfig>,
+    state_fields: &[StateHashField],
     input_fields: &[InputField],
     frame_size: usize,
     rollout_frames: usize,
     crashes_dir: &Path,
     struct_size: usize,
     fillhead_info: Option<(usize, usize)>,
-    checkpoint_table: &mut Vec<Option<Vec<u8>>>,
+    checkpoint_table: &mut Vec<Option<(Vec<u8>, u32)>>,
 ) {
     if frame_size == 0 || rollout_frames == 0 || snapshot.len() < struct_size {
         return;
     }
 
-    // Unique seed per burst so consecutive bursts explore different inputs.
     static BURST_COUNTER: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
     let burst_id = BURST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1153,34 +1198,41 @@ fn checkpoint_burst(
         ^ burst_id.wrapping_mul(0x517c_c1b7_2722_0a95);
     let mut rng = StdRand::with_seed(seed);
 
-    // Resolve zone-specific field constraints: look up which zone the current
-    // bucket falls in, then use its field_constraints map.  If no zone config
-    // is present we pass an empty map, which causes generate_zone_frames to fall
-    // back to target_value sampling (DDG-guided, not pure random).
-    let empty_constraints: HashMap<String, FieldRange> = HashMap::new();
-    let field_constraints: &HashMap<String, FieldRange> = if let Some(zc) = zone_config {
-        // Find the zone whose [fillhead_lo, fillhead_hi) contains this bucket.
-        let zone = zc
-            .zones
-            .iter()
-            .find(|z| bucket as i32 >= z.fillhead_lo && (bucket as i32) < z.fillhead_hi)
-            .or_else(|| zc.zones.last())
-            .unwrap();
-        &zone.field_constraints
+    // Resolve zone constraints for current bucket and, when near a zone boundary,
+    // the next zone.  Ramp generation: when the bucket is within RAMP_WINDOW of
+    // the zone's upper boundary, Phase 1 uses current-zone frames to keep
+    // accumulators healthy, Phase 2 switches to next-zone frames so the burst
+    // can cross the boundary rather than triggering the next zone's decay check.
+    let empty: HashMap<String, FieldRange> = HashMap::new();
+    let frames = if let Some(zc) = zone_config {
+        if let Some(cur_idx) = find_zone_idx(&zc.zones, bucket) {
+            let cur_zone = &zc.zones[cur_idx];
+            let gap = cur_zone.fillhead_hi - 1 - bucket as i32;
+            let next_zone = if gap <= RAMP_WINDOW { zc.zones.get(cur_idx + 1) } else { None };
+            if let Some(nz) = next_zone {
+                // Ramp: 70% current zone frames + 30% next zone frames.
+                let phase1 = rollout_frames * 7 / 10;
+                let phase2 = rollout_frames - phase1;
+                let mut f = generate_zone_frames(
+                    &cur_zone.field_constraints, input_fields, frame_size, phase1, &mut rng,
+                );
+                f.extend(generate_zone_frames(
+                    &nz.field_constraints, input_fields, frame_size, phase2, &mut rng,
+                ));
+                f
+            } else {
+                generate_zone_frames(
+                    &cur_zone.field_constraints, input_fields, frame_size, rollout_frames, &mut rng,
+                )
+            }
+        } else {
+            let last = zc.zones.last().map(|z| &z.field_constraints).unwrap_or(&empty);
+            generate_zone_frames(last, input_fields, frame_size, rollout_frames, &mut rng)
+        }
     } else {
-        &empty_constraints
+        generate_zone_frames(&empty, input_fields, frame_size, rollout_frames, &mut rng)
     };
 
-    let frames = generate_zone_frames(
-        field_constraints,
-        input_fields,
-        frame_size,
-        rollout_frames,
-        &mut rng,
-    );
-
-    // Reset the checkpoint flag before forking so a stale value from the last
-    // fuzz_one can't be mistaken for the burst child's result.
     unsafe {
         if !CHECKPOINT_MAP_PTR.is_null() {
             *CHECKPOINT_MAP_PTR = 0;
@@ -1194,8 +1246,6 @@ fn checkpoint_burst(
     }
 
     if child == 0 {
-        // Child: null coverage maps to avoid corrupting LibAFL's shmem, but keep
-        // CHECKPOINT_MAP_PTR live so we can report the burst's FillHead peak back.
         unsafe {
             COV_MAP_PTR = std::ptr::null_mut();
             STATE_MAP_PTR = std::ptr::null_mut();
@@ -1215,13 +1265,10 @@ fn checkpoint_burst(
             }
         });
 
-        // Write the burst's FillHead peak via checkpoint shmem so the parent can
-        // record any advance. Only write if we observed positive FillHead.
         if burst_fillhead_max > 0 {
             unsafe {
                 if !CHECKPOINT_MAP_PTR.is_null() {
                     *CHECKPOINT_MAP_PTR = 1;
-                    // Clamp to u8::MAX; parent validates against checkpoint_table.len().
                     *CHECKPOINT_MAP_PTR.add(1) = burst_fillhead_max.min(u8::MAX as i32) as u8;
                     std::ptr::copy_nonoverlapping(
                         burst_best_snap.as_ptr(),
@@ -1235,15 +1282,12 @@ fn checkpoint_burst(
         unsafe { libc::_exit(0) };
     }
 
-    // Parent: wait for child, then read any burst checkpoint advance before
-    // checking crash so we don't miss advances from a crashing burst.
     let mut status: libc::c_int = 0;
     unsafe { libc::waitpid(child, &mut status, 0) };
 
     if unsafe { !CHECKPOINT_MAP_PTR.is_null() && *CHECKPOINT_MAP_PTR == 1 } {
         let burst_bucket = unsafe { *CHECKPOINT_MAP_PTR.add(1) } as usize;
-        // Only record a genuine advance beyond the starting checkpoint.
-        if burst_bucket < checkpoint_table.len() && burst_bucket > bucket && checkpoint_table[burst_bucket].is_none() {
+        if burst_bucket < checkpoint_table.len() && burst_bucket > bucket {
             let mut snap = vec![0u8; struct_size];
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -1252,8 +1296,22 @@ fn checkpoint_burst(
                     struct_size,
                 );
             }
-            checkpoint_table[burst_bucket] = Some(snap);
-            eprintln!("[goexplore] burst advance: bucket {bucket} → {burst_bucket}");
+            let disc_offset = fillhead_info.map(|(o, _)| o).unwrap_or(usize::MAX);
+            let sub_accum = zone_config.map(|zc| zc.sub_accumulator_fields.as_slice()).unwrap_or(&[]);
+            let quality = snapshot_quality(&snap, sub_accum, state_fields, disc_offset);
+            let update = match &checkpoint_table[burst_bucket] {
+                None => true,
+                Some((_, prev_q)) => quality > *prev_q,
+            };
+            if update {
+                let is_new = checkpoint_table[burst_bucket].is_none();
+                checkpoint_table[burst_bucket] = Some((snap, quality));
+                if is_new {
+                    eprintln!("[goexplore] burst advance: bucket {bucket} → {burst_bucket} (quality={quality})");
+                } else {
+                    eprintln!("[goexplore] burst quality upgrade: bucket {burst_bucket} quality={quality}");
+                }
+            }
         }
     }
 
@@ -1491,6 +1549,7 @@ fn main() {
 
     let config = loaded.config.clone();
     let sf = state_fields;
+    let burst_state_fields = sf.clone();
 
     let mut harness = move |input: &BytesInput| {
         // Reset checkpoint flag so stale data from the previous run is ignored.
@@ -1624,7 +1683,7 @@ fn main() {
         .map(|zc| zc.max_fillhead as usize)
         .unwrap_or(255);
     let chk_table_len = max_fillhead + 1;
-    let mut checkpoint_table: Vec<Option<Vec<u8>>> = vec![None; chk_table_len];
+    let mut checkpoint_table: Vec<Option<(Vec<u8>, u32)>> = vec![None; chk_table_len];
 
     let burst_size = args.burst_size;
     let rollout_frames = args.rollout_frames;
@@ -1653,7 +1712,7 @@ fn main() {
             // Check if the child wrote a new checkpoint into shmem.
             if !chk_ptr.is_null() && unsafe { *chk_ptr } == 1 {
                 let bucket = unsafe { *chk_ptr.add(1) } as usize;
-                if bucket < chk_table_len && checkpoint_table[bucket].is_none() {
+                if bucket < chk_table_len {
                     let mut snap = vec![0u8; struct_size];
                     unsafe {
                         std::ptr::copy_nonoverlapping(
@@ -1662,17 +1721,28 @@ fn main() {
                             struct_size,
                         );
                     }
-                    checkpoint_table[bucket] = Some(snap);
-                    let n_chk = checkpoint_table.iter().filter(|s| s.is_some()).count();
-                    let best = checkpoint_table
-                        .iter()
-                        .enumerate()
-                        .rfind(|(_, s)| s.is_some())
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                    eprintln!(
-                        "[goexplore] NEW checkpoint: bucket={bucket} | total_checkpoints={n_chk} | best_bucket={best}"
-                    );
+                    let disc_offset = fillhead_info.map(|(o, _)| o).unwrap_or(usize::MAX);
+                    let sub_accum = zone_cfg.as_ref()
+                        .map(|zc| zc.sub_accumulator_fields.as_slice())
+                        .unwrap_or(&[]);
+                    let quality = snapshot_quality(&snap, sub_accum, &burst_state_fields, disc_offset);
+                    let is_new = checkpoint_table[bucket].is_none();
+                    let update = is_new || checkpoint_table[bucket].as_ref().map_or(false, |(_, q)| quality > *q);
+                    if update {
+                        checkpoint_table[bucket] = Some((snap, quality));
+                        if is_new {
+                            let n_chk = checkpoint_table.iter().filter(|s| s.is_some()).count();
+                            let best = checkpoint_table
+                                .iter()
+                                .enumerate()
+                                .rfind(|(_, s)| s.is_some())
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
+                            eprintln!(
+                                "[goexplore] NEW checkpoint: bucket={bucket} quality={quality} | total_checkpoints={n_chk} | best_bucket={best}"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1711,12 +1781,12 @@ fn main() {
                     .rfind(|(_, s)| s.is_some())
                     .map(|(i, _)| i);
                 if let Some(bucket) = best_bucket {
-                    if let Some(snap) = checkpoint_table[bucket].clone() {
+                    if let Some((snap, _quality)) = checkpoint_table[bucket].clone() {
                         for _ in 0..burst_repeats {
                             total_bursts += 1;
                             checkpoint_burst(
-                                bucket, &snap, zone_cfg.as_ref(), &burst_fields,
-                                frame_size, rollout_frames, &crashes_dir,
+                                bucket, &snap, zone_cfg.as_ref(), &burst_state_fields,
+                                &burst_fields, frame_size, rollout_frames, &crashes_dir,
                                 struct_size, fillhead_info, &mut checkpoint_table,
                             );
                         }
@@ -1729,7 +1799,7 @@ fn main() {
                 let filled: Vec<(usize, Vec<u8>)> = checkpoint_table
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, s)| s.clone().map(|snap| (i, snap)))
+                    .filter_map(|(i, s)| s.clone().map(|(snap, _q)| (i, snap)))
                     .rev()
                     .collect();
                 if !filled.is_empty() {
@@ -1738,8 +1808,8 @@ fn main() {
                         for _ in 0..per_bucket {
                             total_bursts += 1;
                             checkpoint_burst(
-                                *bucket, snap, zone_cfg.as_ref(), &burst_fields,
-                                frame_size, rollout_frames, &crashes_dir,
+                                *bucket, snap, zone_cfg.as_ref(), &burst_state_fields,
+                                &burst_fields, frame_size, rollout_frames, &crashes_dir,
                                 struct_size, fillhead_info, &mut checkpoint_table,
                             );
                         }
