@@ -130,17 +130,47 @@ All subcommands are run as `PYTHONPATH=./tools python3 -m ddg <cmd>`.
 
 ## prism-runtime
 
-Shared library depended on by all fuzzer binaries. Key exports:
+Shared library depended on by all fuzzer binaries. Has two layers:
+
+### `prism_runtime` (lib.rs) — execution primitives
 
 | Function | Purpose |
 |---|---|
 | `load_config()` | Load `prism-fuzz.toml` (or default) |
 | `harness_dimensions()` | Return input_size, state_size, struct_size from harness |
 | `required_input_len()` | Total bytes needed for configured execution mode |
+| `field_count()`, `field_name()`, `field_offset()`, `field_size()`, `field_is_input()` | Field metadata wrappers |
 | `execute_testcase()` | Run one testcase (simple, no snapshot) |
 | `execute_testcase_with_state_snapshots()` | Run + call closure after every scan cycle with the full struct snapshot |
 | `execute_testcase_from_checkpoint()` | Restore snapshot, then run new frames — core Go-Explore primitive |
 | `Instance` | RAII wrapper around a heap-allocated PLC instance |
+
+### `prism_runtime::fuzzing` (fuzzing.rs) — shared fuzzing types and mutators
+
+All code that was previously duplicated across `prism-go-explore`, `prism-ddg-state`,
+and `prism-ddg-not-dumb` now lives here as a single source of truth:
+
+| Item | Kind | Purpose |
+|---|---|---|
+| `Ddg`, `DdgNode`, `DdgEdge` | types | DDG JSON deserialization |
+| `ProgramLayout`, `FieldLayout` | types | Layout JSON deserialization |
+| `WeightsJson`, `InputFieldGuide` | types | Weights JSON deserialization |
+| `StateHashConfigRaw`, `StateHashField`, `BucketScheme` | types | State hash config |
+| `SubAccumulatorField` | type | Zone constraints (go-explore specific but shared for `snapshot_quality`) |
+| `FieldRole`, `FieldValueModel`, `InputField` | types | Input field model |
+| `build_ddg_distances`, `build_name_scores`, `infer_i16_targets_from_ddg` | fns | DDG analysis |
+| `build_runtime_input_fields` | fn | DDG-fallback input field building (uses `field_*` wrappers) |
+| `input_fields_from_weights_json` | fn | Parse input fields + byte weights from weights JSON |
+| `ddg_byte_weights` | fn | Derive per-byte weights from DDG fields |
+| `parse_state_hash_config`, `read_i32_from_state`, `compute_bucket` | fns | State hash ops |
+| `snapshot_quality` | fn | Score a struct snapshot for checkpoint selection |
+| `WeightedIndex`, `pick_usize`, `expand_weights_for_sequence` | helpers | Weighted random |
+| `AccumulationWindowMutator` | mutator | Joint-good-frame window stamping |
+| `FieldValueMutator` | mutator | DDG-score-weighted field mutation |
+| `FramePatternMutator` | mutator | Role-aware bool field patterns |
+| `InputRangeMutator` | mutator | Byte-weight-guided candidate value selection |
+| `DdgByteMutator` | mutator | Per-byte DDG proximity weighted flip |
+| `COV_MAP_SIZE`, `STATE_MAP_SIZE` | consts | Shared shmem sizes |
 
 ### Execution modes (`prism-fuzz.toml` or config file)
 - `SingleCycle` — one input frame per testcase (default)
@@ -155,7 +185,7 @@ checkpoint-and-burst exploration.
 
 ### Data structures
 - **Checkpoint table** — `Vec<Option<(snapshot: Vec<u8>, quality: u32)>>` indexed by
-  discriminant bucket value (0..max_fillhead). One slot per possible discriminant value.
+  discriminant bucket value (0..max_discriminant). One slot per possible discriminant value.
 - **State hash fields** — parsed from `_harness_heuristics.json`; drive a secondary
   `StdMapObserver` fed into LibAFL's `MaxMapFeedback`.
 - **Zone constraints** — parsed from `_zone_constraints.json`; drive burst frame generation.
@@ -166,27 +196,30 @@ checkpoint-and-burst exploration.
 loop {
   // Phase 1: standard LibAFL mutation fuzzing
   for _ in 0..burst_size {
+      // Write chk_gen to shmem bytes 3-4 before fork (child will echo it back)
       fuzzer.fuzz_one(...)   // normal LibAFL iteration
-      // harness closure: tracks state hash HWM + FillHead peak, writes to checkpoint shmem
-      // parent: reads checkpoint shmem, updates checkpoint table
+      // harness closure (in child): tracks state hash HWM + discriminant peak, writes checkpoint shmem
+      // parent (after waitpid): validates generation, reads checkpoint, updates table
   }
 
   // Phase 2: checkpoint bursts
   for each selected checkpoint (Best or RoundRobin strategy):
       for _ in 0..burst_repeats:
-          checkpoint_burst(bucket, snapshot, zone_config, ...)
+          checkpoint_burst(bucket, snapshot, zone_config, ..., chk_gen)
 }
 ```
 
-### Checkpoint shmem IPC
-A shared memory region of size `CHECKPOINT_HDR + struct_size`:
-- Byte 0: flag (1 = new checkpoint available)
-- Byte 1: discriminant bucket value
-- Bytes 2..: PLC struct snapshot
+### Checkpoint shmem IPC (5-byte header)
+A shared memory region of size `CHECKPOINT_HDR(5) + struct_size`:
+- Byte 0:   flag (1 = new checkpoint available)
+- Bytes 1-2: discriminant bucket as u16 LE (supports max_discriminant > 255)
+- Bytes 3-4: generation counter as u16 LE (parent writes before fork, child echoes back)
+- Bytes 5+:  PLC struct snapshot
 
-The harness closure (running inside `InProcessForkExecutor`'s child) writes here after
-each testcase. The parent reads after each `fuzz_one` call.
-`checkpoint_burst` also uses this region to pass burst-found checkpoints back.
+The generation counter detects stale shmem reads: if the echoed generation does not
+match what the parent wrote before the fork, the read is discarded.
+The parent writes `chk_gen` to bytes 3-4 before each `fuzz_one`; the child reads and
+echoes it. After `waitpid`, the parent checks that the returned generation matches.
 
 ### Zone-aware burst frame generation
 For each burst:

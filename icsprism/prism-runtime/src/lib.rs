@@ -1,3 +1,5 @@
+pub mod fuzzing;
+
 use std::{
     collections::HashMap,
     ffi::CStr,
@@ -176,6 +178,16 @@ pub fn field_name(idx: u32) -> Option<String> {
 /// Number of fields in the PLC struct.
 pub fn field_count() -> u32 {
     unsafe { prism_field_count() }
+}
+
+/// Byte size of field `idx`.
+pub fn field_size(idx: u32) -> usize {
+    unsafe { prism_field_size(idx) }
+}
+
+/// Whether field `idx` is a VAR_INPUT field.
+pub fn field_is_input(idx: u32) -> bool {
+    unsafe { prism_field_is_input(idx) == 1 }
 }
 
 /// Program name as declared in the ST source.

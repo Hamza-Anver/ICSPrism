@@ -298,23 +298,24 @@ def run(args) -> None:
         field_ranges[name] = (lo, hi)
 
     n_zones   = max(1, args.zones)
-    zone_size = max(1, (max_fillhead + 1 + n_zones - 1) // n_zones)
+    max_discriminant = max_fillhead  # alias for clarity in zone calculations
+    zone_size = max(1, (max_discriminant + 1 + n_zones - 1) // n_zones)
 
     zones = []
     for z in range(n_zones):
-        fh_lo = z * zone_size
-        fh_hi = min((z + 1) * zone_size, max_fillhead + 1)
+        lo = z * zone_size
+        hi = min((z + 1) * zone_size, max_fillhead + 1)
         field_constraints = {
             fname: _zone_constraint_for_field(z, n_zones, glo, ghi)
             for fname, (glo, ghi) in field_ranges.items()
         }
         zones.append({
             "id":                z,
-            "fillhead_lo":       fh_lo,
-            "fillhead_hi":       fh_hi,
+            "lo":                lo,
+            "hi":                hi,
             "field_constraints": field_constraints,
         })
-        print(f"[zones]   zone {z}: FillHead [{fh_lo}, {fh_hi})  "
+        print(f"[zones]   zone {z}: discriminant [{lo}, {hi})  "
               f"constraints={list(field_constraints.keys())}")
 
     # -----------------------------------------------------------------------
@@ -330,13 +331,13 @@ def run(args) -> None:
 
     import json
     doc = {
-        "program":                top_struct_name,
-        "discriminant_field":     discriminant_name,
-        "fillhead_byte_offset":   discriminant_offset,
-        "fillhead_byte_size":     discriminant_size,
-        "max_fillhead":           max_fillhead,
-        "sub_accumulator_fields": sub_accum_fields,
-        "zones":                  zones,
+        "program":                  top_struct_name,
+        "discriminant_field":       discriminant_name,
+        "discriminant_byte_offset": discriminant_offset,
+        "discriminant_byte_size":   discriminant_size,
+        "max_discriminant":         max_fillhead,
+        "sub_accumulator_fields":   sub_accum_fields,
+        "zones":                    zones,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w") as f:

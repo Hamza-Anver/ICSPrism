@@ -1,15 +1,12 @@
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
-    ffi::CStr,
+    collections::HashMap,
     fs::File,
-    os::raw::c_char,
     path::{Path, PathBuf},
 };
 
 use clap::Parser;
 use libafl::{
-    Error,
-    corpus::{CorpusId, InMemoryCorpus, OnDiskCorpus},
+    corpus::{InMemoryCorpus, OnDiskCorpus},
     events::SimpleEventManager,
     executors::{ExitKind, InProcessForkExecutor},
     feedback_or,
@@ -18,15 +15,15 @@ use libafl::{
     generators::RandBytesGenerator,
     inputs::{BytesInput, HasTargetBytes},
     monitors::SimpleMonitor,
-    mutators::{HavocScheduledMutator, MutationResult, Mutator, havoc_mutations},
+    mutators::{HavocScheduledMutator, havoc_mutations},
     observers::{HitcountsMapObserver, StdMapObserver},
     schedulers::QueueScheduler,
     stages::StdMutationalStage,
-    state::{HasRand, StdState},
+    state::StdState,
 };
 use libafl_bolts::{
-    AsSliceMut, Named,
-    rands::{Rand, StdRand},
+    AsSliceMut,
+    rands::StdRand,
     shmem::{ShMemProvider, UnixShMemProvider},
     tuples::{Merge, tuple_list},
 };
@@ -34,36 +31,33 @@ use prism_runtime::{
     execute_testcase_from_checkpoint, execute_testcase_with_state_snapshots,
     harness_dimensions, load_config, required_input_len,
 };
+use prism_runtime::fuzzing::{
+    AccumulationWindowMutator, DdgByteMutator, Ddg, FieldRole, FieldValueMutator,
+    FramePatternMutator, InputField, InputRangeMutator, ProgramLayout, StateHashConfigRaw,
+    StateHashField, SubAccumulatorField, WeightsJson, build_ddg_distances,
+    build_name_scores, build_runtime_input_fields, compute_bucket, ddg_byte_weights,
+    expand_weights_for_sequence, infer_i16_targets_from_ddg, input_fields_from_weights_json,
+    parse_state_hash_config, read_i32_from_state, snapshot_quality,
+    COV_MAP_SIZE, STATE_MAP_SIZE,
+};
 use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
-// Constants
+// Checkpoint shmem header layout (step 3):
+//   byte 0:   flag     (0 = no new checkpoint, 1 = valid checkpoint written)
+//   bytes 1-2: discriminant bucket as u16 LE  (removes the old u8 / 255 cap)
+//   bytes 3-4: generation counter as u16 LE   (detects stale reads)
+//   bytes 5+:  PLC struct snapshot
 // ---------------------------------------------------------------------------
-
-const COV_MAP_SIZE: usize = 65536;
-const STATE_MAP_SIZE: usize = 1024;
-/// Checkpoint shmem header: [flag: u8][fillhead_bucket: u8]
-const CHECKPOINT_HDR: usize = 2;
-/// How many buckets from the zone boundary to start generating ramp (transition) frames.
-const RAMP_WINDOW: i32 = 2;
+const CHECKPOINT_HDR: usize = 5;
 
 static mut COV_MAP_PTR: *mut u8 = std::ptr::null_mut();
 static mut STATE_MAP_PTR: *mut u8 = std::ptr::null_mut();
-/// Shared memory for child→parent checkpoint IPC. Points to a shmem region
-/// of size CHECKPOINT_HDR + struct_size. Child writes flag=1 + bucket + snapshot;
-/// parent reads after each fuzz_one call.
 static mut CHECKPOINT_MAP_PTR: *mut u8 = std::ptr::null_mut();
 
 // ---------------------------------------------------------------------------
 // SanitizerCoverage callbacks
 // ---------------------------------------------------------------------------
-
-unsafe extern "C" {
-    fn prism_field_count() -> u32;
-    fn prism_field_name(idx: u32) -> *const c_char;
-    fn prism_field_size(idx: u32) -> usize;
-    fn prism_field_is_input(idx: u32) -> i32;
-}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __sanitizer_cov_trace_pc_guard_init(mut start: *mut u32, stop: *mut u32) {
@@ -101,7 +95,7 @@ pub extern "C" fn __sanitizer_cov_trace_pc_guard(guard: *mut u32) {
 #[derive(Parser, Debug)]
 #[command(
     name = "prism-go-explore",
-    about = "Go-Explore ST fuzzer: checkpoint at FillHead high-watermarks, burst with zone-aware frames"
+    about = "Go-Explore ST fuzzer: checkpoint at discriminant high-watermarks, burst with zone-aware frames"
 )]
 struct Args {
     #[arg(long)]
@@ -116,7 +110,7 @@ struct Args {
     #[arg(long)]
     state_hash: Option<PathBuf>,
 
-    /// Zone constraints JSON (fillhead byte offset, zone ranges, pvsum decomposition).
+    /// Zone constraints JSON (discriminant byte offset, zone ranges, pvsum decomposition).
     #[arg(long)]
     zone_constraints: Option<PathBuf>,
 
@@ -169,21 +163,15 @@ struct FieldRange {
 struct ZoneConstraint {
     #[allow(dead_code)]
     id: usize,
-    fillhead_lo: i32,
-    fillhead_hi: i32,
+    /// Lower bound (inclusive) of the discriminant range for this zone.
+    #[serde(alias = "fillhead_lo")]
+    lo: i32,
+    /// Upper bound (exclusive) of the discriminant range for this zone.
+    #[serde(alias = "fillhead_hi")]
+    hi: i32,
     /// Generic per-field constraints: maps field name → [lo, hi] sampling range.
     #[serde(default)]
     field_constraints: std::collections::HashMap<String, FieldRange>,
-}
-
-/// A state variable that directly gates the discriminant's accumulation.
-/// Used to score snapshot quality: higher sum → better starting point for bursts.
-#[derive(Debug, Clone, Deserialize)]
-struct SubAccumulatorField {
-    #[allow(dead_code)]
-    name: String,
-    byte_offset: usize,
-    byte_size: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -191,893 +179,42 @@ struct ZoneConstraintsConfig {
     #[allow(dead_code)]
     discriminant_field: String,
     /// Absolute byte offset of the discriminant field within the struct snapshot.
-    fillhead_byte_offset: usize,
-    fillhead_byte_size: usize,
+    #[serde(alias = "fillhead_byte_offset")]
+    discriminant_byte_offset: usize,
+    #[serde(alias = "fillhead_byte_size")]
+    discriminant_byte_size: usize,
     /// Inclusive upper bound for the discriminant — sets checkpoint table size.
-    #[serde(default = "default_max_fillhead")]
-    max_fillhead: u32,
-    /// State variables that directly gate discriminant accumulation (from accumulation chain).
-    /// When non-empty, quality = sum of these fields' values in the snapshot.
-    /// When empty, quality falls back to sum of high-watermark state-hash fields.
+    #[serde(alias = "max_fillhead", default = "default_max_discriminant")]
+    max_discriminant: u32,
+    /// State variables that directly gate discriminant accumulation.
     #[serde(default)]
     sub_accumulator_fields: Vec<SubAccumulatorField>,
     zones: Vec<ZoneConstraint>,
 }
 
-fn default_max_fillhead() -> u32 {
+fn default_max_discriminant() -> u32 {
     255
 }
 
 // ---------------------------------------------------------------------------
-// DDG deserialization
+// Zone helpers
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
-struct DdgNode {
-    id: u64,
-    defines: Option<String>,
-    ir: String,
-    has_dynamic_index: bool,
-}
+/// How many buckets from the zone boundary to start generating ramp (transition) frames.
+const RAMP_WINDOW: i32 = 2;
 
-#[derive(Debug, Deserialize)]
-struct DdgEdge {
-    from: u64,
-    to: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct Ddg {
-    nodes: Vec<DdgNode>,
-    edges: Vec<DdgEdge>,
-}
-
-#[derive(Debug, Deserialize)]
-struct FieldLayout {
-    name: Option<String>,
-    llvm_type: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProgramLayout {
-    struct_name: String,
-    total_bytes: u64,
-    fields: Vec<FieldLayout>,
-}
-
-// ---------------------------------------------------------------------------
-// Weights JSON (from probe_ddg_adv.py)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct InputFieldGuide {
-    name: String,
-    #[allow(dead_code)]
-    llvm_type: String,
-    byte_size: usize,
-    byte_offset: usize,
-    model: String,
-    roles: Vec<String>,
-    #[serde(default)]
-    target_values: Vec<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WeightsJson {
-    #[allow(dead_code)]
-    main_function: String,
-    #[allow(dead_code)]
-    frame_size: usize,
-    input_fields: Vec<InputFieldGuide>,
-    byte_weights: Vec<f32>,
-}
-
-// ---------------------------------------------------------------------------
-// State hash config (from ddg_state_hash_heuristics.py)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct StateHashFieldRaw {
-    name: String,
-    absolute_byte_offset: usize,
-    byte_size: usize,
-    bucket_scheme: String,
-    thresholds: Vec<i32>,
-    bucket_count: usize,
-    high_watermark: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct StateHashConfigRaw {
-    #[allow(dead_code)]
-    program: String,
-    #[allow(dead_code)]
-    total_macro_states: u64,
-    fields: Vec<StateHashFieldRaw>,
-}
-
-#[derive(Debug, Clone)]
-enum BucketScheme {
-    Identity,
-    ThresholdFine,
-    ThresholdLog2,
-    RawCapped,
-    Binary,
-}
-
-#[derive(Debug, Clone)]
-struct StateHashField {
-    name: String,
-    absolute_byte_offset: usize,
-    byte_size: usize,
-    bucket_scheme: BucketScheme,
-    thresholds: Vec<i32>,
-    bucket_count: usize,
-    high_watermark: bool,
-    shmem_base: usize,
-}
-
-fn parse_state_hash_config(raw: StateHashConfigRaw) -> Vec<StateHashField> {
-    let mut fields = Vec::new();
-    let mut shmem_base = 0usize;
-    for f in raw.fields {
-        if shmem_base >= STATE_MAP_SIZE {
-            eprintln!("[prism-go-explore] WARNING: state shmem full, skipping {}", f.name);
-            break;
-        }
-        let bucket_count = f.bucket_count.max(1).min(STATE_MAP_SIZE - shmem_base);
-        let scheme = match f.bucket_scheme.as_str() {
-            "identity" => BucketScheme::Identity,
-            "threshold_fine" => BucketScheme::ThresholdFine,
-            "threshold_log2" => BucketScheme::ThresholdLog2,
-            "raw_capped" => BucketScheme::RawCapped,
-            _ => BucketScheme::Binary,
-        };
-        fields.push(StateHashField {
-            name: f.name,
-            absolute_byte_offset: f.absolute_byte_offset,
-            byte_size: f.byte_size,
-            bucket_scheme: scheme,
-            thresholds: f.thresholds,
-            bucket_count,
-            high_watermark: f.high_watermark,
-            shmem_base,
-        });
-        shmem_base += bucket_count;
-    }
-    fields
-}
-
-fn read_i32_from_state(buf: &[u8], offset: usize, size: usize) -> i32 {
-    let end = offset + size;
-    if end > buf.len() || size == 0 {
-        return 0;
-    }
-    match size {
-        1 => i8::from_le_bytes([buf[offset]]) as i32,
-        2 => i16::from_le_bytes([buf[offset], buf[offset + 1]]) as i32,
-        4 => i32::from_le_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]]),
-        _ => 0,
-    }
-}
-
-fn compute_bucket(field: &StateHashField, value: i32) -> usize {
-    let capped = value.max(0) as usize;
-    match field.bucket_scheme {
-        BucketScheme::Identity => field
-            .thresholds
-            .iter()
-            .position(|&t| t == value)
-            .unwrap_or(field.bucket_count - 1),
-        BucketScheme::ThresholdFine | BucketScheme::RawCapped | BucketScheme::Binary => {
-            capped.min(field.bucket_count - 1)
-        }
-        BucketScheme::ThresholdLog2 => {
-            let n = field.thresholds.iter().filter(|&&t| value >= t).count();
-            n.min(field.bucket_count - 1)
-        }
-    }
-}
-
-/// Return the quality score for a snapshot — higher means better accumulators.
-///
-/// If the zone config supplies explicit sub-accumulator fields (state variables
-/// that directly gate the discriminant's increment), sum those.  Otherwise fall
-/// back to summing all high-watermark state-hash fields except the discriminant,
-/// which approximates "how much useful state has built up".
-fn snapshot_quality(
-    snap: &[u8],
-    sub_accum: &[SubAccumulatorField],
-    state_fields: &[StateHashField],
-    discriminant_offset: usize,
-) -> u32 {
-    if !sub_accum.is_empty() {
-        return sub_accum
-            .iter()
-            .map(|f| read_i32_from_state(snap, f.byte_offset, f.byte_size).max(0) as u32)
-            .sum();
-    }
-    state_fields
-        .iter()
-        .filter(|f| f.high_watermark && f.absolute_byte_offset != discriminant_offset)
-        .map(|f| read_i32_from_state(snap, f.absolute_byte_offset, f.byte_size).max(0) as u32)
-        .sum()
-}
-
-/// Return the index into `zones` whose [fillhead_lo, fillhead_hi) contains `bucket`.
+/// Return the index into `zones` whose [lo, hi) contains `bucket`.
 fn find_zone_idx(zones: &[ZoneConstraint], bucket: usize) -> Option<usize> {
     zones
         .iter()
-        .position(|z| bucket as i32 >= z.fillhead_lo && (bucket as i32) < z.fillhead_hi)
-}
-
-// ---------------------------------------------------------------------------
-// Input field model and role
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum FieldRole {
-    Inhibitor,
-    Activator,
-    Driver,
-    Other,
-}
-
-#[derive(Debug, Clone)]
-enum FieldValueModel {
-    Bool,
-    I16 { targets: Vec<i16> },
-    Raw,
-}
-
-#[derive(Debug, Clone)]
-struct InputField {
-    name: String,
-    offset: usize,
-    size: usize,
-    model: FieldValueModel,
-    ddg_score: f32,
-    role: FieldRole,
-}
-
-// ---------------------------------------------------------------------------
-// DDG analysis helpers
-// ---------------------------------------------------------------------------
-
-fn build_ddg_distances(ddg: &Ddg) -> HashMap<u64, u32> {
-    let sinks: Vec<u64> = ddg
-        .nodes
-        .iter()
-        .filter(|n| n.has_dynamic_index)
-        .map(|n| n.id)
-        .collect();
-    let mut rev_adj: HashMap<u64, Vec<u64>> = HashMap::new();
-    for edge in &ddg.edges {
-        rev_adj.entry(edge.to).or_default().push(edge.from);
-    }
-    let mut dist: HashMap<u64, u32> = HashMap::new();
-    let mut queue: VecDeque<u64> = VecDeque::new();
-    for &sink in &sinks {
-        dist.insert(sink, 0);
-        queue.push_back(sink);
-    }
-    while let Some(node_id) = queue.pop_front() {
-        let d = dist[&node_id];
-        if let Some(preds) = rev_adj.get(&node_id) {
-            for &pred in preds {
-                if !dist.contains_key(&pred) {
-                    dist.insert(pred, d + 1);
-                    queue.push_back(pred);
-                }
-            }
-        }
-    }
-    dist
-}
-
-fn build_name_scores(ddg: &Ddg, dist: &HashMap<u64, u32>) -> HashMap<String, f32> {
-    let mut name_score: HashMap<String, f32> = HashMap::new();
-    for node in &ddg.nodes {
-        if let Some(def) = &node.defines {
-            let name = def.trim_start_matches('%').to_string();
-            let score = dist
-                .get(&node.id)
-                .map(|&d| 1.0 / (1.0 + d as f32))
-                .unwrap_or(0.0);
-            let prev = name_score.entry(name).or_insert(0.0);
-            if score > *prev {
-                *prev = score;
-            }
-        }
-    }
-    name_score
-}
-
-fn parse_int_literals(s: &str) -> Vec<i32> {
-    let mut out = Vec::new();
-    let mut buf = String::new();
-    for c in s.chars() {
-        if c == '-' || c.is_ascii_digit() {
-            buf.push(c);
-        } else if !buf.is_empty() {
-            if let Ok(v) = buf.parse::<i32>() {
-                out.push(v);
-            }
-            buf.clear();
-        }
-    }
-    if !buf.is_empty() {
-        if let Ok(v) = buf.parse::<i32>() {
-            out.push(v);
-        }
-    }
-    out
-}
-
-fn infer_i16_targets_from_ddg(ddg: &Ddg, dist: &HashMap<u64, u32>) -> Vec<i16> {
-    let mut set = BTreeSet::new();
-    for node in &ddg.nodes {
-        if !dist.contains_key(&node.id) {
-            continue;
-        }
-        let ir = node.ir.to_ascii_lowercase();
-        if !(ir.contains("icmp") || ir.contains("switch")) {
-            continue;
-        }
-        for n in parse_int_literals(&node.ir) {
-            if (i16::MIN as i32..=i16::MAX as i32).contains(&n) {
-                let v = n as i16;
-                set.insert(v);
-                set.insert(v.saturating_add(1));
-                set.insert(v.saturating_sub(1));
-            }
-        }
-    }
-    if set.is_empty() {
-        for v in [0i16, 1, 2, 3, 4, 7, 15, 31, 50, 59, 60, 70, 71, 90, 100] {
-            set.insert(v);
-        }
-    }
-    set.into_iter().collect()
-}
-
-fn looks_boolish(name: &str, llvm_type: &str, size: usize) -> bool {
-    if llvm_type.trim() != "i8" || size != 1 {
-        return false;
-    }
-    let n = name.to_ascii_lowercase();
-    n.starts_with("cmd")
-        || n.contains("enable")
-        || n.contains("start")
-        || n.contains("reset")
-        || n.contains("arm")
-        || n.contains("trigger")
-}
-
-fn build_runtime_input_fields(
-    layout: &ProgramLayout,
-    frame_size: usize,
-    name_scores: &HashMap<String, f32>,
-    i16_targets: &[i16],
-) -> Vec<InputField> {
-    let mut type_by_name: HashMap<String, String> = HashMap::new();
-    for field in &layout.fields {
-        if let Some(name) = &field.name {
-            type_by_name.insert(name.clone(), field.llvm_type.clone());
-        }
-    }
-    let mut fields = Vec::new();
-    let mut packed_offset = 0usize;
-    let field_count = unsafe { prism_field_count() };
-    for idx in 0..field_count {
-        if unsafe { prism_field_is_input(idx) } != 1 {
-            continue;
-        }
-        let name_ptr = unsafe { prism_field_name(idx) };
-        if name_ptr.is_null() {
-            continue;
-        }
-        let name = unsafe { CStr::from_ptr(name_ptr) }
-            .to_string_lossy()
-            .into_owned();
-        let size = unsafe { prism_field_size(idx) };
-        let offset = packed_offset;
-        packed_offset = packed_offset.saturating_add(size);
-        if offset + size > frame_size || size == 0 {
-            continue;
-        }
-        let llvm_type = type_by_name
-            .get(&name)
-            .cloned()
-            .unwrap_or_else(|| "i8".to_string());
-        let model = if looks_boolish(&name, &llvm_type, size) {
-            FieldValueModel::Bool
-        } else if llvm_type.trim() == "i16" && size == 2 {
-            FieldValueModel::I16 {
-                targets: i16_targets.to_vec(),
-            }
-        } else {
-            FieldValueModel::Raw
-        };
-        let ddg_score = name_scores.get(&name).copied().unwrap_or(0.0);
-        fields.push(InputField {
-            name,
-            offset,
-            size,
-            model,
-            ddg_score,
-            role: FieldRole::Other,
-        });
-    }
-    fields
-}
-
-// ---------------------------------------------------------------------------
-// Weighted random helpers
-// ---------------------------------------------------------------------------
-
-struct WeightedIndex {
-    cumulative: Vec<f32>,
-}
-
-impl WeightedIndex {
-    fn new(weights: impl IntoIterator<Item = f32>) -> Self {
-        let source: Vec<f32> = weights.into_iter().collect();
-        let all_zero = source.iter().all(|v| *v <= 0.0);
-        let mut cumulative = Vec::with_capacity(source.len());
-        let mut sum = 0.0f32;
-        for w in source {
-            let effective = if all_zero { 1.0 } else { w.max(0.0001) };
-            sum += effective;
-            cumulative.push(sum);
-        }
-        Self { cumulative }
-    }
-
-    fn sample<R: Rand>(&self, rand: &mut R) -> Option<usize> {
-        let total = self.cumulative.last().copied()?;
-        let r = rand.next_float() as f32 * total;
-        let idx = self.cumulative.partition_point(|&c| c < r);
-        Some(idx.min(self.cumulative.len().saturating_sub(1)))
-    }
-}
-
-fn pick_usize<R: Rand>(rand: &mut R, upper: usize) -> Option<usize> {
-    if upper == 0 {
-        return None;
-    }
-    Some((rand.next() as usize) % upper)
-}
-
-fn expand_weights_for_sequence(base_weights: &[f32], required_len: usize) -> Vec<f32> {
-    if base_weights.is_empty() {
-        return vec![1.0; required_len.max(1)];
-    }
-    if required_len <= base_weights.len() {
-        return base_weights[..required_len].to_vec();
-    }
-    let mut out = Vec::with_capacity(required_len);
-    while out.len() < required_len {
-        let rem = required_len - out.len();
-        let take = rem.min(base_weights.len());
-        out.extend_from_slice(&base_weights[..take]);
-    }
-    out
-}
-
-// ---------------------------------------------------------------------------
-// Mutators (unchanged from prism-ddg-state)
-// ---------------------------------------------------------------------------
-
-struct AccumulationWindowMutator {
-    frame_size: usize,
-    driver_fields: Vec<(usize, Vec<Vec<u8>>)>,
-    #[allow(dead_code)]
-    inhibitor_offsets: Vec<usize>,
-    min_window: usize,
-}
-
-impl AccumulationWindowMutator {
-    fn new(frame_size: usize, fields: &[InputField]) -> Self {
-        let driver_fields = fields
-            .iter()
-            .filter(|f| f.role != FieldRole::Inhibitor)
-            .filter_map(|f| match &f.model {
-                FieldValueModel::I16 { targets } if !targets.is_empty() => {
-                    let candidates: Vec<Vec<u8>> =
-                        targets.iter().map(|&v| v.to_le_bytes().to_vec()).collect();
-                    Some((f.offset, candidates))
-                }
-                FieldValueModel::Bool if f.role == FieldRole::Activator => {
-                    Some((f.offset, vec![vec![1u8]]))
-                }
-                _ => None,
-            })
-            .collect();
-        let inhibitor_offsets = fields
-            .iter()
-            .filter_map(|f| (f.role == FieldRole::Inhibitor).then_some(f.offset))
-            .collect();
-        Self { frame_size, driver_fields, inhibitor_offsets, min_window: 9 }
-    }
-}
-
-impl Named for AccumulationWindowMutator {
-    fn name(&self) -> &std::borrow::Cow<'static, str> {
-        static N: std::sync::OnceLock<std::borrow::Cow<'static, str>> = std::sync::OnceLock::new();
-        N.get_or_init(|| std::borrow::Cow::Borrowed("AccumulationWindowMutator"))
-    }
-}
-
-impl<S> Mutator<BytesInput, S> for AccumulationWindowMutator
-where
-    S: HasRand,
-{
-    fn mutate(&mut self, state: &mut S, input: &mut BytesInput) -> Result<MutationResult, Error> {
-        if self.frame_size == 0 || self.driver_fields.is_empty() {
-            return Ok(MutationResult::Skipped);
-        }
-        let bytes: &mut Vec<u8> = input.as_mut();
-        let frame_count = bytes.len() / self.frame_size;
-        if frame_count < self.min_window {
-            return Ok(MutationResult::Skipped);
-        }
-        let mut good_frame = vec![0u8; self.frame_size];
-        for (off, candidates) in &self.driver_fields {
-            let Some(vi) = pick_usize(state.rand_mut(), candidates.len()) else { continue };
-            let val = &candidates[vi];
-            let write_len = val.len().min(self.frame_size.saturating_sub(*off));
-            good_frame[*off..*off + write_len].copy_from_slice(&val[..write_len]);
-        }
-        let max_window = frame_count;
-        let window_len = self.min_window
-            + (state.rand_mut().next() as usize) % (max_window - self.min_window + 1);
-        let Some(window_start) =
-            pick_usize(state.rand_mut(), frame_count.saturating_sub(window_len) + 1)
-        else {
-            return Ok(MutationResult::Skipped);
-        };
-        let window_end = (window_start + window_len).min(frame_count);
-        for f in window_start..window_end {
-            let d_start = f * self.frame_size;
-            bytes[d_start..d_start + self.frame_size].copy_from_slice(&good_frame);
-        }
-        Ok(MutationResult::Mutated)
-    }
-
-    fn post_exec(&mut self, _state: &mut S, _new_corpus_id: Option<CorpusId>) -> Result<(), Error> {
-        Ok(())
-    }
-}
-
-struct FieldValueMutator {
-    frame_size: usize,
-    fields: Vec<InputField>,
-    picker: WeightedIndex,
-}
-
-impl FieldValueMutator {
-    fn new(frame_size: usize, fields: Vec<InputField>) -> Self {
-        let picker = WeightedIndex::new(fields.iter().map(|f| f.ddg_score));
-        Self { frame_size, fields, picker }
-    }
-}
-
-impl Named for FieldValueMutator {
-    fn name(&self) -> &std::borrow::Cow<'static, str> {
-        static N: std::sync::OnceLock<std::borrow::Cow<'static, str>> = std::sync::OnceLock::new();
-        N.get_or_init(|| std::borrow::Cow::Borrowed("FieldValueMutator"))
-    }
-}
-
-impl<S> Mutator<BytesInput, S> for FieldValueMutator
-where
-    S: HasRand,
-{
-    fn mutate(&mut self, state: &mut S, input: &mut BytesInput) -> Result<MutationResult, Error> {
-        if self.frame_size == 0 || self.fields.is_empty() {
-            return Ok(MutationResult::Skipped);
-        }
-        let bytes: &mut Vec<u8> = input.as_mut();
-        let frames = bytes.len() / self.frame_size;
-        let Some(frame_idx) = pick_usize(state.rand_mut(), frames) else {
-            return Ok(MutationResult::Skipped);
-        };
-        let Some(field_idx) = self.picker.sample(state.rand_mut()) else {
-            return Ok(MutationResult::Skipped);
-        };
-        let field = &self.fields[field_idx];
-        let start = frame_idx * self.frame_size + field.offset;
-        let end = start + field.size;
-        if end > bytes.len() {
-            return Ok(MutationResult::Skipped);
-        }
-        match &field.model {
-            FieldValueModel::Bool => {
-                bytes[start] = (state.rand_mut().next() & 1) as u8;
-            }
-            FieldValueModel::I16 { targets } => {
-                if field.size != 2 {
-                    return Ok(MutationResult::Skipped);
-                }
-                let choose_target = (state.rand_mut().next() % 100) < 80 && !targets.is_empty();
-                let value: i16 = if choose_target {
-                    let Some(i) = pick_usize(state.rand_mut(), targets.len()) else {
-                        return Ok(MutationResult::Skipped);
-                    };
-                    targets[i]
-                } else {
-                    state.rand_mut().next() as i16
-                };
-                let [lo, hi] = value.to_le_bytes();
-                bytes[start] = lo;
-                bytes[start + 1] = hi;
-            }
-            FieldValueModel::Raw => {
-                for b in &mut bytes[start..end] {
-                    *b = state.rand_mut().next() as u8;
-                }
-            }
-        }
-        Ok(MutationResult::Mutated)
-    }
-
-    fn post_exec(&mut self, _state: &mut S, _new_corpus_id: Option<CorpusId>) -> Result<(), Error> {
-        Ok(())
-    }
-}
-
-struct FramePatternMutator {
-    frame_size: usize,
-    activator_offsets: Vec<usize>,
-    inhibitor_offsets: Vec<usize>,
-}
-
-impl FramePatternMutator {
-    fn new(frame_size: usize, fields: &[InputField]) -> Self {
-        let activator_offsets = fields
-            .iter()
-            .filter_map(|f| {
-                if matches!(f.model, FieldValueModel::Bool) && f.role != FieldRole::Inhibitor {
-                    Some(f.offset)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let inhibitor_offsets = fields
-            .iter()
-            .filter_map(|f| {
-                if matches!(f.model, FieldValueModel::Bool) && f.role == FieldRole::Inhibitor {
-                    Some(f.offset)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        Self { frame_size, activator_offsets, inhibitor_offsets }
-    }
-}
-
-impl Named for FramePatternMutator {
-    fn name(&self) -> &std::borrow::Cow<'static, str> {
-        static N: std::sync::OnceLock<std::borrow::Cow<'static, str>> = std::sync::OnceLock::new();
-        N.get_or_init(|| std::borrow::Cow::Borrowed("FramePatternMutator"))
-    }
-}
-
-impl<S> Mutator<BytesInput, S> for FramePatternMutator
-where
-    S: HasRand,
-{
-    fn mutate(&mut self, state: &mut S, input: &mut BytesInput) -> Result<MutationResult, Error> {
-        if self.frame_size == 0 {
-            return Ok(MutationResult::Skipped);
-        }
-        let bytes: &mut Vec<u8> = input.as_mut();
-        let frame_count = bytes.len() / self.frame_size;
-        if frame_count < 2 {
-            return Ok(MutationResult::Skipped);
-        }
-        let has_activators = !self.activator_offsets.is_empty();
-        let has_inhibitors = !self.inhibitor_offsets.is_empty();
-        let op_count = 1 + usize::from(has_activators) + usize::from(has_inhibitors);
-        let op = (state.rand_mut().next() as usize) % op_count;
-        match op {
-            0 => {
-                let Some(src) = pick_usize(state.rand_mut(), frame_count) else {
-                    return Ok(MutationResult::Skipped);
-                };
-                let Some(dst) = pick_usize(state.rand_mut(), frame_count) else {
-                    return Ok(MutationResult::Skipped);
-                };
-                let max_run = (frame_count - dst).min(8).max(1);
-                let Some(run_len) = pick_usize(state.rand_mut(), max_run) else {
-                    return Ok(MutationResult::Skipped);
-                };
-                let src_frame =
-                    bytes[src * self.frame_size..src * self.frame_size + self.frame_size].to_vec();
-                for i in 0..=run_len {
-                    let d = dst + i;
-                    if d >= frame_count {
-                        break;
-                    }
-                    let d_start = d * self.frame_size;
-                    bytes[d_start..d_start + self.frame_size].copy_from_slice(&src_frame);
-                }
-            }
-            1 if has_activators => {
-                let Some(oi) = pick_usize(state.rand_mut(), self.activator_offsets.len()) else {
-                    return Ok(MutationResult::Skipped);
-                };
-                let off = self.activator_offsets[oi];
-                let Some(pulse_frame) = pick_usize(state.rand_mut(), frame_count) else {
-                    return Ok(MutationResult::Skipped);
-                };
-                let window_start = pulse_frame.saturating_sub(1);
-                let window_end = (pulse_frame + 1).min(frame_count - 1);
-                for f in window_start..=window_end {
-                    bytes[f * self.frame_size + off] = 0;
-                }
-                bytes[pulse_frame * self.frame_size + off] = 1;
-            }
-            _ if has_inhibitors => {
-                let Some(oi) = pick_usize(state.rand_mut(), self.inhibitor_offsets.len()) else {
-                    return Ok(MutationResult::Skipped);
-                };
-                let off = self.inhibitor_offsets[oi];
-                let min_window = 9usize.min(frame_count);
-                let max_window = frame_count;
-                let window_len = min_window
-                    + (state.rand_mut().next() as usize) % (max_window - min_window + 1);
-                let Some(window_start) =
-                    pick_usize(state.rand_mut(), frame_count.saturating_sub(window_len) + 1)
-                else {
-                    return Ok(MutationResult::Skipped);
-                };
-                let window_end = (window_start + window_len).min(frame_count);
-                for f in window_start..window_end {
-                    bytes[f * self.frame_size + off] = 0;
-                }
-            }
-            _ => return Ok(MutationResult::Skipped),
-        }
-        Ok(MutationResult::Mutated)
-    }
-
-    fn post_exec(&mut self, _state: &mut S, _new_corpus_id: Option<CorpusId>) -> Result<(), Error> {
-        Ok(())
-    }
-}
-
-struct InputRangeMutator {
-    frame_size: usize,
-    fields: Vec<(usize, usize, Vec<Vec<u8>>)>,
-    picker: WeightedIndex,
-}
-
-impl InputRangeMutator {
-    fn new(frame_size: usize, input_fields: &[InputField], byte_weights: &[f32]) -> Self {
-        let mut fields = Vec::new();
-        for field in input_fields {
-            let candidates: Vec<Vec<u8>> = match &field.model {
-                FieldValueModel::Bool => vec![vec![0u8], vec![1u8]],
-                FieldValueModel::I16 { targets } => {
-                    targets.iter().map(|&v| v.to_le_bytes().to_vec()).collect()
-                }
-                FieldValueModel::Raw => continue,
-            };
-            if !candidates.is_empty() {
-                fields.push((field.offset, field.size, candidates));
-            }
-        }
-        let weights: Vec<f32> = if byte_weights.len() == frame_size {
-            byte_weights.to_vec()
-        } else {
-            vec![1.0; frame_size]
-        };
-        let field_weights: Vec<f32> = fields
-            .iter()
-            .map(|(off, sz, _)| {
-                let start = *off;
-                let end = (start + sz).min(weights.len());
-                if start >= end { return 0.0; }
-                let sum: f32 = weights[start..end].iter().copied().sum();
-                (sum / (end - start) as f32).max(0.0)
-            })
-            .collect();
-        let picker = WeightedIndex::new(field_weights);
-        Self { frame_size, fields, picker }
-    }
-}
-
-impl Named for InputRangeMutator {
-    fn name(&self) -> &std::borrow::Cow<'static, str> {
-        static N: std::sync::OnceLock<std::borrow::Cow<'static, str>> = std::sync::OnceLock::new();
-        N.get_or_init(|| std::borrow::Cow::Borrowed("InputRangeMutator"))
-    }
-}
-
-impl<S> Mutator<BytesInput, S> for InputRangeMutator
-where
-    S: HasRand,
-{
-    fn mutate(&mut self, state: &mut S, input: &mut BytesInput) -> Result<MutationResult, Error> {
-        let bytes: &mut Vec<u8> = input.as_mut();
-        if bytes.is_empty() || self.fields.is_empty() {
-            return Ok(MutationResult::Skipped);
-        }
-        let Some(fi) = self.picker.sample(state.rand_mut()) else {
-            return Ok(MutationResult::Skipped);
-        };
-        let (offset, size, candidates) = &self.fields[fi];
-        let frame_count = bytes.len() / self.frame_size;
-        if frame_count == 0 {
-            return Ok(MutationResult::Skipped);
-        }
-        let frame_idx = (state.rand_mut().next() as usize) % frame_count;
-        let base = frame_idx * self.frame_size + offset;
-        let Some(vi) = pick_usize(state.rand_mut(), candidates.len()) else {
-            return Ok(MutationResult::Skipped);
-        };
-        let val = &candidates[vi];
-        let write_len = val.len().min(*size).min(bytes.len().saturating_sub(base));
-        bytes[base..base + write_len].copy_from_slice(&val[..write_len]);
-        Ok(MutationResult::Mutated)
-    }
-
-    fn post_exec(&mut self, _state: &mut S, _new_corpus_id: Option<CorpusId>) -> Result<(), Error> {
-        Ok(())
-    }
-}
-
-struct DdgByteMutator {
-    picker: WeightedIndex,
-}
-
-impl DdgByteMutator {
-    fn new(weights: Vec<f32>) -> Self {
-        Self { picker: WeightedIndex::new(weights) }
-    }
-}
-
-impl Named for DdgByteMutator {
-    fn name(&self) -> &std::borrow::Cow<'static, str> {
-        static N: std::sync::OnceLock<std::borrow::Cow<'static, str>> = std::sync::OnceLock::new();
-        N.get_or_init(|| std::borrow::Cow::Borrowed("DdgByteMutator"))
-    }
-}
-
-impl<S> Mutator<BytesInput, S> for DdgByteMutator
-where
-    S: HasRand,
-{
-    fn mutate(&mut self, state: &mut S, input: &mut BytesInput) -> Result<MutationResult, Error> {
-        let bytes: &mut Vec<u8> = input.as_mut();
-        if bytes.is_empty() {
-            return Ok(MutationResult::Skipped);
-        }
-        let Some(idx) = self.picker.sample(state.rand_mut()) else {
-            return Ok(MutationResult::Skipped);
-        };
-        if idx >= bytes.len() {
-            return Ok(MutationResult::Skipped);
-        }
-        let new_val = state.rand_mut().next() as u8;
-        bytes[idx] = if bytes[idx] == new_val { new_val.wrapping_add(1) } else { new_val };
-        Ok(MutationResult::Mutated)
-    }
-
-    fn post_exec(&mut self, _state: &mut S, _new_corpus_id: Option<CorpusId>) -> Result<(), Error> {
-        Ok(())
-    }
+        .position(|z| bucket as i32 >= z.lo && (bucket as i32) < z.hi)
 }
 
 // ---------------------------------------------------------------------------
 // Zone-aware frame generation
 // ---------------------------------------------------------------------------
 
-fn rand_i16_in(rng: &mut impl Rand, lo: i16, hi: i16) -> i16 {
+fn rand_i16_in(rng: &mut impl libafl_bolts::rands::Rand, lo: i16, hi: i16) -> i16 {
     if lo >= hi {
         return lo;
     }
@@ -1094,42 +231,26 @@ fn write_i16_le(buf: &mut [u8], offset: usize, value: i16) {
 }
 
 /// Generate `n_frames` packed input frames for a checkpoint burst.
-///
-/// For each input field per frame:
-///   - Inhibitors: zeroed (all `size` bytes, not just one).
-///   - In `field_constraints`: sampled uniformly from [lo, hi].
-///   - I16 with target values: sampled from target list (80%) or uniform (20%).
-///   - Bool: random 0/1.
-///   - Otherwise: left as 0.
-///
-/// `field_constraints` is the zone's generic map (field name → [lo, hi]).
-/// Passing an empty map is valid — it triggers pure target-value-guided generation,
-/// which is the correct fallback when no zone config is available.
 fn generate_zone_frames(
     field_constraints: &HashMap<String, FieldRange>,
     input_fields: &[InputField],
     frame_size: usize,
     n_frames: usize,
-    rng: &mut impl Rand,
+    rng: &mut impl libafl_bolts::rands::Rand,
 ) -> Vec<u8> {
     let mut out = vec![0u8; frame_size * n_frames];
-
     for fi in 0..n_frames {
         let frame = &mut out[fi * frame_size..(fi + 1) * frame_size];
-
         for field in input_fields {
             if field.offset >= frame_size || field.size == 0 {
                 continue;
             }
             let end = (field.offset + field.size).min(frame_size);
-
             if field.role == FieldRole::Inhibitor {
-                // Zero all bytes of the inhibitor (not just byte 0).
                 for b in &mut frame[field.offset..end] {
                     *b = 0;
                 }
             } else if let Some(range) = field_constraints.get(&field.name) {
-                // Zone-specific constraint: sample from [lo, hi].
                 if field.size == 2 {
                     write_i16_le(frame, field.offset, rand_i16_in(rng, range.lo, range.hi));
                 } else if field.size == 1 {
@@ -1137,9 +258,10 @@ fn generate_zone_frames(
                     frame[field.offset] = v;
                 }
             } else {
-                // No zone constraint: fall back to sampling from target_values.
                 match &field.model {
-                    FieldValueModel::I16 { targets } if !targets.is_empty() => {
+                    prism_runtime::fuzzing::FieldValueModel::I16 { targets }
+                        if !targets.is_empty() =>
+                    {
                         let use_target = (rng.next() % 100) < 80;
                         let value: i16 = if use_target {
                             targets[(rng.next() as usize) % targets.len()]
@@ -1150,26 +272,47 @@ fn generate_zone_frames(
                             write_i16_le(frame, field.offset, value);
                         }
                     }
-                    FieldValueModel::Bool => {
+                    prism_runtime::fuzzing::FieldValueModel::Bool => {
                         frame[field.offset] = (rng.next() & 1) as u8;
                     }
-                    _ => {} // Raw / unknown: leave 0
+                    _ => {}
                 }
             }
         }
     }
-
     out
 }
 
 // ---------------------------------------------------------------------------
-// Checkpoint burst: fork, run zone frames from checkpoint, detect crash.
+// Checkpoint shmem helpers (step 3)
 // ---------------------------------------------------------------------------
 
-/// Restore PLC state from `snapshot` then run `rollout_frames` zone-appropriate
-/// input frames in a forked child. The child tracks its FillHead peak and writes
-/// it back via CHECKPOINT_MAP_PTR so the parent can record new checkpoint advances.
-/// If the child dies by signal, save the frames as a crash artifact and exit.
+unsafe fn chk_read_bucket(ptr: *const u8) -> usize {
+    let lo = unsafe { *ptr.add(1) } as usize;
+    let hi = unsafe { *ptr.add(2) } as usize;
+    lo | (hi << 8)
+}
+
+unsafe fn chk_read_gen(ptr: *const u8) -> u16 {
+    let lo = unsafe { *ptr.add(3) } as u16;
+    let hi = unsafe { *ptr.add(4) } as u16;
+    lo | (hi << 8)
+}
+
+unsafe fn chk_write_header(ptr: *mut u8, flag: u8, bucket: usize, chk_gen: u16) {
+    unsafe {
+        *ptr = flag;
+        *ptr.add(1) = (bucket & 0xFF) as u8;
+        *ptr.add(2) = ((bucket >> 8) & 0xFF) as u8;
+        *ptr.add(3) = (chk_gen & 0xFF) as u8;
+        *ptr.add(4) = ((chk_gen >> 8) & 0xFF) as u8;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint burst
+// ---------------------------------------------------------------------------
+
 fn checkpoint_burst(
     bucket: usize,
     snapshot: &[u8],
@@ -1180,15 +323,15 @@ fn checkpoint_burst(
     rollout_frames: usize,
     crashes_dir: &Path,
     struct_size: usize,
-    fillhead_info: Option<(usize, usize)>,
+    discriminant_info: Option<(usize, usize)>,
     checkpoint_table: &mut Vec<Option<(Vec<u8>, u32)>>,
+    chk_gen: u16,
 ) {
     if frame_size == 0 || rollout_frames == 0 || snapshot.len() < struct_size {
         return;
     }
 
-    static BURST_COUNTER: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
+    static BURST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let burst_id = BURST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1198,19 +341,13 @@ fn checkpoint_burst(
         ^ burst_id.wrapping_mul(0x517c_c1b7_2722_0a95);
     let mut rng = StdRand::with_seed(seed);
 
-    // Resolve zone constraints for current bucket and, when near a zone boundary,
-    // the next zone.  Ramp generation: when the bucket is within RAMP_WINDOW of
-    // the zone's upper boundary, Phase 1 uses current-zone frames to keep
-    // accumulators healthy, Phase 2 switches to next-zone frames so the burst
-    // can cross the boundary rather than triggering the next zone's decay check.
     let empty: HashMap<String, FieldRange> = HashMap::new();
     let frames = if let Some(zc) = zone_config {
         if let Some(cur_idx) = find_zone_idx(&zc.zones, bucket) {
             let cur_zone = &zc.zones[cur_idx];
-            let gap = cur_zone.fillhead_hi - 1 - bucket as i32;
+            let gap = cur_zone.hi - 1 - bucket as i32;
             let next_zone = if gap <= RAMP_WINDOW { zc.zones.get(cur_idx + 1) } else { None };
             if let Some(nz) = next_zone {
-                // Ramp: 70% current zone frames + 30% next zone frames.
                 let phase1 = rollout_frames * 7 / 10;
                 let phase2 = rollout_frames - phase1;
                 let mut f = generate_zone_frames(
@@ -1233,6 +370,7 @@ fn checkpoint_burst(
         generate_zone_frames(&empty, input_fields, frame_size, rollout_frames, &mut rng)
     };
 
+    // Zero the flag before forking so the child starts clean.
     unsafe {
         if !CHECKPOINT_MAP_PTR.is_null() {
             *CHECKPOINT_MAP_PTR = 0;
@@ -1246,30 +384,37 @@ fn checkpoint_burst(
     }
 
     if child == 0 {
+        // In child: disable parent shmem regions and run the burst.
         unsafe {
             COV_MAP_PTR = std::ptr::null_mut();
             STATE_MAP_PTR = std::ptr::null_mut();
         }
 
-        let mut burst_fillhead_max = -1i32;
+        let mut burst_discriminant_max = -1i32;
         let mut burst_best_snap = vec![0u8; struct_size];
 
         execute_testcase_from_checkpoint(snapshot, &frames, frame_size, &mut |snap| {
-            if let Some((off, sz)) = fillhead_info {
+            if let Some((off, sz)) = discriminant_info {
                 let v = read_i32_from_state(snap, off, sz);
-                if v > burst_fillhead_max {
-                    burst_fillhead_max = v;
+                if v > burst_discriminant_max {
+                    burst_discriminant_max = v;
                     let n = snap.len().min(burst_best_snap.len());
                     burst_best_snap[..n].copy_from_slice(&snap[..n]);
                 }
             }
         });
 
-        if burst_fillhead_max > 0 {
+        if burst_discriminant_max > 0 {
             unsafe {
                 if !CHECKPOINT_MAP_PTR.is_null() {
-                    *CHECKPOINT_MAP_PTR = 1;
-                    *CHECKPOINT_MAP_PTR.add(1) = burst_fillhead_max.min(u8::MAX as i32) as u8;
+                    // Zero the full header first, then write atomically.
+                    std::ptr::write_bytes(CHECKPOINT_MAP_PTR, 0, CHECKPOINT_HDR);
+                    chk_write_header(
+                        CHECKPOINT_MAP_PTR,
+                        1,
+                        burst_discriminant_max as usize,
+                        chk_gen,
+                    );
                     std::ptr::copy_nonoverlapping(
                         burst_best_snap.as_ptr(),
                         CHECKPOINT_MAP_PTR.add(CHECKPOINT_HDR),
@@ -1285,9 +430,12 @@ fn checkpoint_burst(
     let mut status: libc::c_int = 0;
     unsafe { libc::waitpid(child, &mut status, 0) };
 
-    if unsafe { !CHECKPOINT_MAP_PTR.is_null() && *CHECKPOINT_MAP_PTR == 1 } {
-        let burst_bucket = unsafe { *CHECKPOINT_MAP_PTR.add(1) } as usize;
-        if burst_bucket < checkpoint_table.len() && burst_bucket > bucket {
+    // Read only after waitpid — child has fully exited, no race.
+    let flag = unsafe { if !CHECKPOINT_MAP_PTR.is_null() { *CHECKPOINT_MAP_PTR } else { 0 } };
+    if flag == 1 {
+        let burst_bucket = unsafe { chk_read_bucket(CHECKPOINT_MAP_PTR) };
+        let returned_gen = unsafe { chk_read_gen(CHECKPOINT_MAP_PTR) };
+        if returned_gen == chk_gen && burst_bucket < checkpoint_table.len() && burst_bucket > bucket {
             let mut snap = vec![0u8; struct_size];
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -1296,8 +444,9 @@ fn checkpoint_burst(
                     struct_size,
                 );
             }
-            let disc_offset = fillhead_info.map(|(o, _)| o).unwrap_or(usize::MAX);
-            let sub_accum = zone_config.map(|zc| zc.sub_accumulator_fields.as_slice()).unwrap_or(&[]);
+            let disc_offset = discriminant_info.map(|(o, _)| o).unwrap_or(usize::MAX);
+            let sub_accum =
+                zone_config.map(|zc| zc.sub_accumulator_fields.as_slice()).unwrap_or(&[]);
             let quality = snapshot_quality(&snap, sub_accum, state_fields, disc_offset);
             let update = match &checkpoint_table[burst_bucket] {
                 None => true,
@@ -1307,9 +456,13 @@ fn checkpoint_burst(
                 let is_new = checkpoint_table[burst_bucket].is_none();
                 checkpoint_table[burst_bucket] = Some((snap, quality));
                 if is_new {
-                    eprintln!("[goexplore] burst advance: bucket {bucket} → {burst_bucket} (quality={quality})");
+                    eprintln!(
+                        "[goexplore] burst advance: bucket {bucket} → {burst_bucket} (quality={quality})"
+                    );
                 } else {
-                    eprintln!("[goexplore] burst quality upgrade: bucket {burst_bucket} quality={quality}");
+                    eprintln!(
+                        "[goexplore] burst quality upgrade: bucket {burst_bucket} quality={quality}"
+                    );
                 }
             }
         }
@@ -1317,7 +470,7 @@ fn checkpoint_burst(
 
     if libc::WIFSIGNALED(status) {
         let sig = libc::WTERMSIG(status);
-        eprintln!("[goexplore] CRASH from burst at FillHead bucket={bucket} signal={sig}");
+        eprintln!("[goexplore] CRASH from burst at discriminant bucket={bucket} signal={sig}");
         let crash_path = crashes_dir.join(format!("checkpoint_crash_bucket{bucket}"));
         let mut crash_data = snapshot.to_vec();
         crash_data.extend_from_slice(&frames);
@@ -1381,7 +534,7 @@ fn main() {
         })
         .unwrap_or_default();
 
-    // Zone constraints config (optional — enables checkpoint tracking + zone bursts).
+    // Zone constraints config (optional).
     let zone_config: Option<ZoneConstraintsConfig> = args.zone_constraints.as_ref().map(|p| {
         let raw = std::fs::read_to_string(p)
             .unwrap_or_else(|e| panic!("Cannot read zone constraints {:?}: {e}", p));
@@ -1389,10 +542,10 @@ fn main() {
             .unwrap_or_else(|e| panic!("Cannot parse zone constraints JSON: {e}"))
     });
 
-    // FillHead tracking: (absolute_byte_offset, byte_size) within the struct snapshot.
-    let fillhead_info: Option<(usize, usize)> = zone_config
+    // Discriminant field tracking: (absolute_byte_offset, byte_size) within the struct snapshot.
+    let discriminant_info: Option<(usize, usize)> = zone_config
         .as_ref()
-        .map(|zc| (zc.fillhead_byte_offset, zc.fillhead_byte_size));
+        .map(|zc| (zc.discriminant_byte_offset, zc.discriminant_byte_size));
 
     let dims = harness_dimensions();
     let frame_size = dims.input_size;
@@ -1411,52 +564,10 @@ fn main() {
                 File::open(wp).unwrap_or_else(|e| panic!("Cannot open {:?}: {e}", wp)),
             )
             .unwrap_or_else(|e| panic!("Cannot parse weights JSON: {e}"));
-
-            let mut bw = wj.byte_weights.clone();
-            bw.resize(frame_size, 0.0);
-            bw.truncate(frame_size);
-
-            let json_fields: Vec<InputField> = wj
-                .input_fields
-                .into_iter()
-                .map(|g| {
-                    let model = match g.model.as_str() {
-                        "bool" => FieldValueModel::Bool,
-                        "range_i16" => FieldValueModel::I16 {
-                            targets: g.target_values.iter().map(|&v| v as i16).collect(),
-                        },
-                        _ => FieldValueModel::Raw,
-                    };
-                    let role = if g.roles.iter().any(|r| r == "inhibitor") {
-                        FieldRole::Inhibitor
-                    } else if g.roles.iter().any(|r| r == "activator") {
-                        FieldRole::Activator
-                    } else if g.roles.iter().any(|r| r == "driver") {
-                        FieldRole::Driver
-                    } else {
-                        FieldRole::Other
-                    };
-                    InputField {
-                        name: g.name,
-                        offset: g.byte_offset,
-                        size: g.byte_size,
-                        model,
-                        ddg_score: 0.5,
-                        role,
-                    }
-                })
-                .collect();
-
-            (bw, json_fields, "weights JSON")
+            let (bw, fields) = input_fields_from_weights_json(wj, frame_size);
+            (bw, fields, "weights JSON")
         } else {
-            let mut bw = vec![0.0f32; frame_size];
-            for f in &ddg_input_fields {
-                let score = if f.ddg_score > 0.0 { f.ddg_score } else { 0.05 };
-                let end = (f.offset + f.size).min(frame_size);
-                for w in &mut bw[f.offset..end] {
-                    *w = score;
-                }
-            }
+            let bw = ddg_byte_weights(&ddg_input_fields, frame_size);
             (bw, ddg_input_fields.clone(), "DDG analysis")
         };
 
@@ -1476,9 +587,9 @@ fn main() {
     println!("[prism-go-explore] Rollout frames: {}", args.rollout_frames);
     if let Some(ref zc) = zone_config {
         println!(
-            "[prism-go-explore] Zone config  : {} zones, FillHead@off={}",
+            "[prism-go-explore] Zone config  : {} zones, discriminant@off={}",
             zc.zones.len(),
-            zc.fillhead_byte_offset
+            zc.discriminant_byte_offset
         );
     } else {
         println!("[prism-go-explore] Zone config  : none (checkpoint bursts disabled)");
@@ -1488,8 +599,8 @@ fn main() {
         let role_tag = match f.role {
             FieldRole::Inhibitor => " [inhibitor]",
             FieldRole::Activator => " [activator]",
-            FieldRole::Driver => " [driver]",
-            FieldRole::Other => "",
+            FieldRole::Driver    => " [driver]",
+            FieldRole::Other     => "",
         };
         println!(
             "[prism-go-explore]   {:20} off={:>2} size={:>2} score={:.3}{}",
@@ -1503,7 +614,6 @@ fn main() {
 
     let mut shmem_provider = UnixShMemProvider::new().unwrap();
 
-    // Coverage shmem.
     let mut cov_shmem = shmem_provider.new_shmem(COV_MAP_SIZE).unwrap();
     let cov_ptr = cov_shmem.as_slice_mut().as_mut_ptr();
     unsafe { COV_MAP_PTR = cov_ptr };
@@ -1511,15 +621,13 @@ fn main() {
         StdMapObserver::from_mut_ptr("edges", cov_ptr, COV_MAP_SIZE)
     });
 
-    // State-hash shmem.
     let mut state_shmem = shmem_provider.new_shmem(STATE_MAP_SIZE).unwrap();
     let state_ptr = state_shmem.as_slice_mut().as_mut_ptr();
     unsafe { STATE_MAP_PTR = state_ptr };
     let state_observer =
         unsafe { StdMapObserver::from_mut_ptr("state_hash", state_ptr, STATE_MAP_SIZE) };
 
-    // Checkpoint shmem: [flag: u8][fillhead_bucket: u8][snapshot: struct_size bytes].
-    // Created before shmem_provider is moved into InProcessForkExecutor.
+    // Checkpoint shmem: CHECKPOINT_HDR bytes of header + struct_size bytes of snapshot.
     let mut chk_shmem = shmem_provider.new_shmem(CHECKPOINT_HDR + struct_size).unwrap();
     let chk_ptr = chk_shmem.as_slice_mut().as_mut_ptr();
     unsafe { CHECKPOINT_MAP_PTR = chk_ptr };
@@ -1544,7 +652,7 @@ fn main() {
     let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
 
     // -----------------------------------------------------------------------
-    // Harness: state hash + FillHead checkpoint tracking.
+    // Harness: state hash + discriminant checkpoint tracking.
     // -----------------------------------------------------------------------
 
     let config = loaded.config.clone();
@@ -1552,7 +660,7 @@ fn main() {
     let burst_state_fields = sf.clone();
 
     let mut harness = move |input: &BytesInput| {
-        // Reset checkpoint flag so stale data from the previous run is ignored.
+        // Zero the flag so stale data from the previous run is not re-read.
         unsafe {
             if !CHECKPOINT_MAP_PTR.is_null() {
                 *CHECKPOINT_MAP_PTR = 0;
@@ -1566,8 +674,7 @@ fn main() {
         }
 
         let mut hwm = vec![i32::MIN; sf.len()];
-        // Track FillHead high-watermark and save the snapshot at the peak cycle.
-        let mut fillhead_max = -1i32;
+        let mut discriminant_max = -1i32;
         let mut best_snap = vec![0u8; struct_size];
 
         let executed = execute_testcase_with_state_snapshots(
@@ -1575,7 +682,6 @@ fn main() {
             data,
             frame_size,
             &mut |snap: &[u8]| {
-                // State hash feedback.
                 for (i, field) in sf.iter().enumerate() {
                     let val =
                         read_i32_from_state(snap, field.absolute_byte_offset, field.byte_size);
@@ -1585,11 +691,10 @@ fn main() {
                         hwm[i] = val;
                     }
                 }
-                // FillHead checkpoint tracking.
-                if let Some((off, sz)) = fillhead_info {
+                if let Some((off, sz)) = discriminant_info {
                     let v = read_i32_from_state(snap, off, sz);
-                    if v > fillhead_max {
-                        fillhead_max = v;
+                    if v > discriminant_max {
+                        discriminant_max = v;
                         let n = snap.len().min(best_snap.len());
                         best_snap[..n].copy_from_slice(&snap[..n]);
                     }
@@ -1597,7 +702,6 @@ fn main() {
             },
         );
 
-        // Write state hash shmem.
         if executed && !sf.is_empty() {
             for (i, field) in sf.iter().enumerate() {
                 if hwm[i] == i32::MIN {
@@ -1611,14 +715,14 @@ fn main() {
             }
         }
 
-        // Write checkpoint shmem only when FillHead actually advanced above zero.
-        // fillhead_max == 0 means the program ran but FillHead never accumulated
-        // (idle/INIT phase) — that snapshot is useless as a checkpoint starting point.
-        if executed && fillhead_max > 0 {
+        // Write checkpoint only when discriminant actually advanced above zero.
+        if executed && discriminant_max > 0 {
             unsafe {
                 if !CHECKPOINT_MAP_PTR.is_null() {
-                    *CHECKPOINT_MAP_PTR = 1; // flag: new checkpoint available
-                    *CHECKPOINT_MAP_PTR.add(1) = fillhead_max.max(0).min(u8::MAX as i32) as u8;
+                    // Generation field is written by the parent before fuzz_one;
+                    // echo it back so the parent can verify freshness.
+                    let read_gen = chk_read_gen(CHECKPOINT_MAP_PTR);
+                    chk_write_header(CHECKPOINT_MAP_PTR, 1, discriminant_max as usize, read_gen);
                     let n = best_snap.len().min(struct_size);
                     std::ptr::copy_nonoverlapping(
                         best_snap.as_ptr(),
@@ -1673,16 +777,14 @@ fn main() {
     let mut stages = tuple_list!(StdMutationalStage::new(mutator));
 
     // -----------------------------------------------------------------------
-    // Custom fuzz loop: fuzz_one in bursts, then run checkpoint exploration.
+    // Checkpoint table.
     // -----------------------------------------------------------------------
 
-    // Checkpoint table: one slot per FillHead value from 0 to max_fillhead.
-    // Size is derived from zone config's max_fillhead so it works for any program.
-    let max_fillhead: usize = zone_config
+    let max_discriminant: usize = zone_config
         .as_ref()
-        .map(|zc| zc.max_fillhead as usize)
+        .map(|zc| zc.max_discriminant as usize)
         .unwrap_or(255);
-    let chk_table_len = max_fillhead + 1;
+    let chk_table_len = max_discriminant + 1;
     let mut checkpoint_table: Vec<Option<(Vec<u8>, u32)>> = vec![None; chk_table_len];
 
     let burst_size = args.burst_size;
@@ -1700,19 +802,33 @@ fn main() {
     let mut total_bursts: u64 = 0;
     let mut last_heartbeat = std::time::Instant::now();
     let heartbeat_interval = std::time::Duration::from_secs(30);
+    // Generation counter for checkpoint shmem freshness checks (step 3).
+    let mut chk_gen: u16 = 0;
 
     loop {
-        // Phase 1: standard mutation-guided fuzzing for burst_size iterations.
+        // Phase 1: standard mutation-guided fuzzing.
         for _ in 0..burst_size {
+            // Write current generation to shmem bytes 3-4 so the child can echo it.
+            unsafe {
+                if !chk_ptr.is_null() {
+                    *chk_ptr.add(3) = (chk_gen & 0xFF) as u8;
+                    *chk_ptr.add(4) = ((chk_gen >> 8) & 0xFF) as u8;
+                }
+            }
+            chk_gen = chk_gen.wrapping_add(1);
+
             fuzzer
                 .fuzz_one(&mut stages, &mut executor, &mut state, &mut mgr)
                 .unwrap();
             total_fuzz_iters += 1;
 
-            // Check if the child wrote a new checkpoint into shmem.
-            if !chk_ptr.is_null() && unsafe { *chk_ptr } == 1 {
-                let bucket = unsafe { *chk_ptr.add(1) } as usize;
-                if bucket < chk_table_len {
+            // Read checkpoint written by the child (after waitpid inside fuzz_one).
+            let flag = unsafe { if !chk_ptr.is_null() { *chk_ptr } else { 0 } };
+            if flag == 1 {
+                let bucket = unsafe { chk_read_bucket(chk_ptr) };
+                let returned_gen = unsafe { chk_read_gen(chk_ptr) };
+                let expected_gen = chk_gen.wrapping_sub(1);
+                if returned_gen == expected_gen && bucket < chk_table_len {
                     let mut snap = vec![0u8; struct_size];
                     unsafe {
                         std::ptr::copy_nonoverlapping(
@@ -1721,17 +837,23 @@ fn main() {
                             struct_size,
                         );
                     }
-                    let disc_offset = fillhead_info.map(|(o, _)| o).unwrap_or(usize::MAX);
-                    let sub_accum = zone_cfg.as_ref()
+                    let disc_offset = discriminant_info.map(|(o, _)| o).unwrap_or(usize::MAX);
+                    let sub_accum = zone_cfg
+                        .as_ref()
                         .map(|zc| zc.sub_accumulator_fields.as_slice())
                         .unwrap_or(&[]);
-                    let quality = snapshot_quality(&snap, sub_accum, &burst_state_fields, disc_offset);
+                    let quality =
+                        snapshot_quality(&snap, sub_accum, &burst_state_fields, disc_offset);
                     let is_new = checkpoint_table[bucket].is_none();
-                    let update = is_new || checkpoint_table[bucket].as_ref().map_or(false, |(_, q)| quality > *q);
+                    let update = is_new
+                        || checkpoint_table[bucket]
+                            .as_ref()
+                            .map_or(false, |(_, q)| quality > *q);
                     if update {
                         checkpoint_table[bucket] = Some((snap, quality));
                         if is_new {
-                            let n_chk = checkpoint_table.iter().filter(|s| s.is_some()).count();
+                            let n_chk =
+                                checkpoint_table.iter().filter(|s| s.is_some()).count();
                             let best = checkpoint_table
                                 .iter()
                                 .enumerate()
@@ -1747,7 +869,7 @@ fn main() {
             }
         }
 
-        // Heartbeat: print fuzzing progress every 30 seconds.
+        // Heartbeat.
         if last_heartbeat.elapsed() >= heartbeat_interval {
             last_heartbeat = std::time::Instant::now();
             let elapsed = start_time.elapsed().as_secs_f64();
@@ -1771,10 +893,9 @@ fn main() {
             );
         }
 
-        // Phase 2: burst from checkpoints according to the chosen strategy.
+        // Phase 2: burst from checkpoints.
         match checkpoint_strategy {
             CheckpointStrategy::Best => {
-                // Burst burst_repeats times from the single highest filled checkpoint.
                 let best_bucket = checkpoint_table
                     .iter()
                     .enumerate()
@@ -1787,15 +908,15 @@ fn main() {
                             checkpoint_burst(
                                 bucket, &snap, zone_cfg.as_ref(), &burst_state_fields,
                                 &burst_fields, frame_size, rollout_frames, &crashes_dir,
-                                struct_size, fillhead_info, &mut checkpoint_table,
+                                struct_size, discriminant_info, &mut checkpoint_table,
+                                chk_gen,
                             );
+                            chk_gen = chk_gen.wrapping_add(1);
                         }
                     }
                 }
             }
             CheckpointStrategy::RoundRobin => {
-                // Distribute burst_repeats evenly across all filled checkpoints,
-                // highest to lowest, so intermediate states are also explored.
                 let filled: Vec<(usize, Vec<u8>)> = checkpoint_table
                     .iter()
                     .enumerate()
@@ -1810,8 +931,10 @@ fn main() {
                             checkpoint_burst(
                                 *bucket, snap, zone_cfg.as_ref(), &burst_state_fields,
                                 &burst_fields, frame_size, rollout_frames, &crashes_dir,
-                                struct_size, fillhead_info, &mut checkpoint_table,
+                                struct_size, discriminant_info, &mut checkpoint_table,
+                                chk_gen,
                             );
+                            chk_gen = chk_gen.wrapping_add(1);
                         }
                     }
                 }

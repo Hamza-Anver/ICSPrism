@@ -7,3 +7,5 @@ edition = "2024"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 serde_json = "1"
+libafl = { workspace = true }
+libafl_bolts = { workspace = true }

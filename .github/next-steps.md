@@ -3,47 +3,60 @@
 Improvements to the current approach, roughly ordered by impact.
 Each item is self-contained and can be tackled independently.
 
+Items marked **[DONE]** have been implemented.
+
 ---
 
-## 1. Consolidate duplicated code into `prism-runtime`
+## 1. [DONE] Consolidate duplicated code into `prism-runtime`
 
 **Problem.** `prism-go-explore`, `prism-ddg-state`, and `prism-ddg-not-dumb` all
 duplicate: DDG/layout/weights JSON deserialization structs, all five custom mutators,
 `WeightedIndex`, `pick_usize`, the `SanitizerCoverage` callback pair, and LibAFL
 boilerplate setup.  Changes to any of these must be applied in every binary.
 
-**Action.**
-- Move shared deserialisation types (`InputField`, `FieldValueModel`, `FieldRole`,
-  `WeightsJson`, `DdgNode`/`DdgEdge`/`Ddg`, `ProgramLayout`) into `prism-runtime`.
-- Move all five mutators into `prism-runtime` as public types.
-- Move `build_ddg_distances`, `build_name_scores`, `infer_i16_targets_from_ddg`, and
-  `build_runtime_input_fields` into `prism-runtime`.
-- Each fuzzer binary's `main.rs` should only contain the loop logic, not data loading
-  or field parsing.
+**What was done.**
+All shared types, functions, and mutators moved to `prism_runtime::fuzzing` module
+(`icsprism/prism-runtime/src/fuzzing.rs`):
+- Types: `Ddg`, `DdgNode`, `DdgEdge`, `ProgramLayout`, `FieldLayout`, `WeightsJson`,
+  `InputFieldGuide`, `StateHashConfigRaw`, `StateHashField`, `BucketScheme`,
+  `SubAccumulatorField`, `FieldRole`, `FieldValueModel`, `InputField`.
+- Functions: `build_ddg_distances`, `build_name_scores`, `infer_i16_targets_from_ddg`,
+  `build_runtime_input_fields`, `input_fields_from_weights_json`, `ddg_byte_weights`,
+  `parse_state_hash_config`, `read_i32_from_state`, `compute_bucket`, `snapshot_quality`,
+  `expand_weights_for_sequence`, `pick_usize`.
+- All five mutators: `AccumulationWindowMutator`, `FieldValueMutator`,
+  `FramePatternMutator`, `InputRangeMutator`, `DdgByteMutator`.
+- `field_size()` and `field_is_input()` wrappers added to `prism-runtime/src/lib.rs`.
+- `prism-runtime/Cargo.toml` updated with `libafl` and `libafl_bolts` dependencies.
 
 **Benefit.** Single source of truth; fixes propagate everywhere.
 
 ---
 
-## 2. Remove program-specific naming from Go-Explore
+## 2. [DONE] Remove program-specific naming from Go-Explore
 
 **Problem.** Variable names (`fillhead_*`), log messages ("FillHead bucket"),
 and the `SubAccumulatorField` concept all assume the discriminant is named "FillHead".
 The code actually supports any field — the naming is just misleading residue from the
 pump_controller benchmark.
 
-**Action.**
-- Rename all `fillhead_*` variables to `discriminant_*`.
-- Update log strings accordingly ("discriminant bucket", "discriminant advance").
-- Rename `fillhead_info: Option<(usize, usize)>` → `discriminant_info`.
-- Rename `fillhead_lo`/`fillhead_hi` fields in `ZoneConstraint` to `lo`/`hi`
-  (update both Rust deserialization and Python `zones.py` output).
+**What was done.**
+- All `fillhead_*` Rust local variables renamed to `discriminant_*` in `prism-go-explore`.
+- All log messages updated ("FillHead bucket" → "discriminant bucket", etc.).
+- `ZoneConstraint` fields: `fillhead_lo`/`fillhead_hi` → `lo`/`hi` (with `#[serde(alias)]`
+  for backward compat with old JSON files that use the old key names).
+- `ZoneConstraintsConfig` fields: `fillhead_byte_offset` → `discriminant_byte_offset`,
+  `fillhead_byte_size` → `discriminant_byte_size`, `max_fillhead` → `max_discriminant`
+  (with `#[serde(alias)]` for backward compat).
+- `zones.py` updated to output new key names (`lo`, `hi`, `discriminant_byte_offset`,
+  `discriminant_byte_size`, `max_discriminant`). Old zone_constraints.json files still
+  parse correctly via the serde aliases.
 
 **Benefit.** The tool reads as generic without changing any behavior.
 
 ---
 
-## 3. Make the checkpoint shmem protocol more robust
+## 3. [DONE] Make the checkpoint shmem protocol more robust
 
 **Problem.** The current IPC is a 2-byte header (flag + u8 bucket) followed by a raw
 struct snapshot.  This has two bugs:
@@ -52,13 +65,14 @@ struct snapshot.  This has two bugs:
 - The parent and burst child both write the same shmem region concurrently (no lock);
   a partial write from the burst child can corrupt the parent's read.
 
-**Action.**
-- Extend the header to `[flag: u8][bucket_lo: u8][bucket_hi: u8]` (u16 LE for bucket).
-  Update both writer and reader sides.  Checkpoint table size becomes `max_fillhead + 1`
-  without the 255 cap.
-- Add a generation counter (u16) at byte 3-4 so the parent can detect stale reads.
-- In `checkpoint_burst`, zero the shmem region at the start of the child rather than
-  just setting the flag; the parent should only read after `waitpid` returns.
+**What was done.**
+- Header extended to 5 bytes: `[flag:1][bucket_lo:1][bucket_hi:1][gen_lo:1][gen_hi:1]`.
+  Bucket is now u16 LE — discriminant values up to 65535 supported without truncation.
+- Generation counter (`chk_gen: u16`): parent writes current generation to bytes 3-4 before
+  each `fuzz_one`/`checkpoint_burst`; child echoes it back; parent validates on read.
+- `checkpoint_burst` child zeroes the full 5-byte header with `write_bytes` before writing
+  its result, so no partial-header reads are possible.
+- `CHECKPOINT_HDR` constant updated from 2 to 5.
 
 ---
 
